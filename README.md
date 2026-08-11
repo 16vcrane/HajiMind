@@ -287,6 +287,20 @@ Phase 2 已注册 `baidu_search`、`life_service` 和 `calendar_time`，它们�
 要启用真实百度搜索 Provider Adapter，需要确认并提供：接口 URL、认证方式、
 请求参数或请求体格式，以及一份成功响应 JSON 示例（含搜索结果字段）。
 
+Phase 3 引入 Agent Router。Router 使用结构化 LLM Output 生成
+`RouterDecision`，字段包括 `intent`、`complexity`、`requires_rag`、
+`requires_web`、`requires_weather`、`requires_calendar`、`requires_planning`
+和 `reason`。路由目标为：
+- Simple → LLM
+- Knowledge → RAG
+- Web → Baidu
+- Weather → LifeService
+- Calendar → Calendar
+- Complex / Mixed → Planner
+
+Router 失败时自动回退到旧 Agent。Router 分析过程通过现有 `rag_step` SSE
+事件展示，最终 `RouterDecision` 会写入 Agent Trace；未新增 SSE 事件类型。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`

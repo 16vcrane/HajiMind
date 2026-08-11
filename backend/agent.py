@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from sqlalchemy import select, desc
 
 from auth import get_current_user
+from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
 from models import ChatMessage, ChatSession, User
@@ -19,6 +20,7 @@ from tools import (
     get_last_rag_context,
     reset_tool_call_guards,
     set_rag_step_queue,
+    tool_registry,
 )
 
 load_dotenv()
@@ -26,6 +28,63 @@ load_dotenv()
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
+
+CORE_SYSTEM_PROMPT = (
+    "You are a cute cat bot that loves to help users. "
+    "When responding, you may use tools to assist. "
+    "If you don't know the answer, admit it honestly."
+)
+
+AGENT_SYSTEM_PROMPT = (
+    CORE_SYSTEM_PROMPT
+    + (
+    "Use search_knowledge_base when users ask document/knowledge questions. "
+    "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
+    "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
+    "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
+    "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
+    "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
+    "but do not reveal chain-of-thought. "
+    )
+)
+
+ROUTED_AGENT_PROMPTS = {
+    "rag": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected RAG. Use search_knowledge_base once, then answer from the retrieved context."
+    ),
+    "baidu": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected web search. Use baidu_search when current external web information is needed."
+    ),
+    "life_service": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected life service. Use life_service for weather or forecast requests."
+    ),
+    "calendar": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected calendar/time. Use calendar_time for date, weekday, timezone, and date arithmetic."
+    ),
+    "planner": (
+        CORE_SYSTEM_PROMPT
+        + " The router selected Planner. Decompose the task briefly, use only necessary tools, "
+        "call each tool at most once unless the user explicitly asks otherwise, "
+        "and synthesize a final answer. For mixed tasks, combine all required evidence before planning."
+    ),
+}
+
+ROUTED_TOOL_NAMES = {
+    "rag": ("search_knowledge_base",),
+    "baidu": ("baidu_search",),
+    "life_service": ("life_service",),
+    "calendar": ("calendar_time",),
+    "planner": (
+        "search_knowledge_base",
+        "baidu_search",
+        "life_service",
+        "calendar_time",
+    ),
+}
 
 
 class ConversationStorage:
@@ -175,23 +234,14 @@ def create_agent_instance():
     agent = create_agent(
         model=model,
         tools=get_agent_tools(),
-        system_prompt=(
-            "You are a cute cat bot that loves to help users. "
-            "When responding, you may use tools to assist. "
-            "Use search_knowledge_base when users ask document/knowledge questions. "
-            "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
-            "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
-            "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
-            "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
-            "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
-            "but do not reveal chain-of-thought. "
-            "If you don't know the answer, admit it honestly."
-        ),
+        system_prompt=AGENT_SYSTEM_PROMPT,
     )
     return agent, model
 
 
 agent, model = create_agent_instance()
+router = AgentRouter(model)
+_routed_agents = {}
 storage = ConversationStorage()
 
 
@@ -223,6 +273,93 @@ def _response_to_text(result) -> str:
     return str(result)
 
 
+def _extract_chunk_content(msg) -> str:
+    content = ""
+    if isinstance(msg.content, str):
+        content = msg.content
+    elif isinstance(msg.content, list):
+        for block in msg.content:
+            if isinstance(block, str):
+                content += block
+            elif isinstance(block, dict) and block.get("type") == "text":
+                content += block.get("text", "")
+    return content
+
+
+def _get_routed_agent(route_target: str):
+    if route_target not in ROUTED_TOOL_NAMES:
+        return None
+    if route_target not in _routed_agents:
+        _routed_agents[route_target] = create_agent(
+            model=model,
+            tools=tool_registry.as_langchain_tools(ROUTED_TOOL_NAMES[route_target]),
+            system_prompt=ROUTED_AGENT_PROMPTS[route_target],
+        )
+    return _routed_agents[route_target]
+
+
+def _select_route(user_text: str, messages: list) -> dict:
+    try:
+        decision = router.decide(user_text, history=messages)
+        route_target = resolve_route_target(decision)
+        return {
+            "decision": decision,
+            "route_target": route_target,
+            "router_error": None,
+            "fallback": False,
+        }
+    except Exception as exc:
+        return {
+            "decision": None,
+            "route_target": "fallback",
+            "router_error": str(exc),
+            "fallback": True,
+        }
+
+
+def _router_trace(route_context: dict) -> dict:
+    decision = route_context.get("decision")
+    route_target = route_context.get("route_target", "fallback")
+    return {
+        "tool_used": route_target not in ("llm", "fallback"),
+        "tool_name": route_label(route_target),
+        "router_decision": decision.model_dump() if isinstance(decision, RouterDecision) else None,
+        "route_target": route_target,
+        "router_error": route_context.get("router_error"),
+    }
+
+
+def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
+    trace = _router_trace(route_context)
+    if rag_trace:
+        merged = dict(rag_trace)
+        merged.update(
+            {
+                "router_decision": trace["router_decision"],
+                "route_target": trace["route_target"],
+                "router_error": trace["router_error"],
+            }
+        )
+        return merged
+    return trace
+
+
+def _invoke_routed(route_context: dict, messages: list) -> str:
+    route_target = route_context["route_target"]
+    if route_context.get("fallback"):
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+    if route_target == "llm":
+        return _response_to_text(
+            model.invoke([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages)
+        )
+    selected_agent = _get_routed_agent(route_target)
+    if selected_agent is None:
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+    return _response_to_text(
+        selected_agent.invoke({"messages": messages}, config={"recursion_limit": 10})
+    )
+
+
 def chat_with_agent(user_text: str, user_id: int, session_id: str):
     messages = storage.load(user_id, session_id)
     get_last_rag_context(clear=True)
@@ -232,17 +369,18 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
         summary = summarize_old_messages(model, messages[:40])
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
+    route_context = _select_route(user_text, messages)
     messages.append(HumanMessage(content=user_text))
-    result = agent.invoke({"messages": messages}, config={"recursion_limit": 8})
-    response_content = _response_to_text(result)
+    response_content = _invoke_routed(route_context, messages)
     messages.append(AIMessage(content=response_content))
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
+    agent_trace = _merge_agent_trace(route_context, rag_trace)
+    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": agent_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
 
-    return {"response": response_content, "rag_trace": rag_trace}
+    return {"response": response_content, "rag_trace": agent_trace}
 
 
 async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
@@ -262,30 +400,62 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
         summary = summarize_old_messages(model, messages[:40])
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
+    yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': '正在分析问题', 'detail': ''}}, ensure_ascii=False)}\n\n"
+    route_context = await asyncio.to_thread(_select_route, user_text, messages)
+    decision = route_context.get("decision")
+    if isinstance(decision, RouterDecision):
+        yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': decision.intent, 'detail': decision.reason}}, ensure_ascii=False)}\n\n"
+    elif route_context.get("router_error"):
+        yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '⚠️', 'label': 'Router 失败，回退现有 Agent', 'detail': route_context['router_error']}}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '➡️', 'label': route_label(route_context['route_target']), 'detail': ''}}, ensure_ascii=False)}\n\n"
+
     messages.append(HumanMessage(content=user_text))
     full_response = ""
 
     async def _agent_worker():
         nonlocal full_response
         try:
-            async for msg, metadata in agent.astream(
+            route_target = route_context["route_target"]
+            if route_context.get("fallback"):
+                selected_agent = agent
+                async for msg, metadata in selected_agent.astream(
+                    {"messages": messages},
+                    stream_mode="messages",
+                    config={"recursion_limit": 8},
+                ):
+                    if not isinstance(msg, AIMessageChunk):
+                        continue
+                    if getattr(msg, "tool_call_chunks", None):
+                        continue
+                    content = _extract_chunk_content(msg)
+                    if content:
+                        full_response += content
+                        await output_queue.put({"type": "content", "content": content})
+                return
+
+            if route_target == "llm":
+                async for msg in model.astream([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages):
+                    if not isinstance(msg, AIMessageChunk):
+                        continue
+                    content = _extract_chunk_content(msg)
+                    if content:
+                        full_response += content
+                        await output_queue.put({"type": "content", "content": content})
+                return
+
+            selected_agent = _get_routed_agent(route_target)
+            if selected_agent is None:
+                selected_agent = agent
+            async for msg, metadata in selected_agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
-                config={"recursion_limit": 8},
+                config={"recursion_limit": 10},
             ):
                 if not isinstance(msg, AIMessageChunk):
                     continue
                 if getattr(msg, "tool_call_chunks", None):
                     continue
-                content = ""
-                if isinstance(msg.content, str):
-                    content = msg.content
-                elif isinstance(msg.content, list):
-                    for block in msg.content:
-                        if isinstance(block, str):
-                            content += block
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            content += block.get("text", "")
+                content = _extract_chunk_content(msg)
                 if content:
                     full_response += content
                     await output_queue.put({"type": "content", "content": content})
@@ -316,10 +486,11 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    if rag_trace:
-        yield f"data: {json.dumps({'type': 'trace', 'rag_trace': rag_trace}, ensure_ascii=False)}\n\n"
+    agent_trace = _merge_agent_trace(route_context, rag_trace)
+    if agent_trace:
+        yield f"data: {json.dumps({'type': 'trace', 'rag_trace': agent_trace}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
     messages.append(AIMessage(content=full_response))
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
+    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": agent_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any
 
 
 class ChatRequest(BaseModel):
@@ -43,6 +43,9 @@ class RetrievedChunk(BaseModel):
 class RagTrace(BaseModel):
     tool_used: bool
     tool_name: str
+    router_decision: Optional[dict[str, Any]] = None
+    route_target: Optional[str] = None
+    router_error: Optional[str] = None
     query: Optional[str] = None
     expanded_query: Optional[str] = None
     step_back_question: Optional[str] = None

@@ -244,6 +244,18 @@
                         <details class="reasoning-details">
                             <summary>检索过程</summary>
                             <div class="reasoning-content">
+                                <div v-if="msg.ragTrace.router_decision" class="trace-line">
+                                    Router：{{ msg.ragTrace.router_decision.intent }} / {{ msg.ragTrace.router_decision.complexity }}
+                                </div>
+                                <div v-if="msg.ragTrace.route_target" class="trace-line">
+                                    路由目标：{{ msg.ragTrace.route_target }}
+                                </div>
+                                <div v-if="msg.ragTrace.router_decision && msg.ragTrace.router_decision.reason" class="trace-line">
+                                    路由原因：{{ msg.ragTrace.router_decision.reason }}
+                                </div>
+                                <div v-if="msg.ragTrace.router_error" class="trace-line">
+                                    Router回退：{{ msg.ragTrace.router_error }}
+                                </div>
                                 <div class="trace-line">
                                     工具：{{ msg.ragTrace.tool_used ? msg.ragTrace.tool_name : '未使用' }}
                                 </div>

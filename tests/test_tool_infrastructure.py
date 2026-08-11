@@ -131,6 +131,14 @@ class ToolInfrastructureTests(unittest.TestCase):
         self.assertIn("guide.pdf", result.to_agent_content())
         self.assertEqual(get_last_rag_context()["rag_trace"]["tool_name"], "search_knowledge_base")
 
+    def test_router_failure_context_falls_back_to_existing_agent(self):
+        with patch.object(agent.router, "decide", side_effect=RuntimeError("router down")):
+            route_context = agent._select_route("test question", [])
+
+        self.assertTrue(route_context["fallback"])
+        self.assertEqual(route_context["route_target"], "fallback")
+        self.assertIn("router down", route_context["router_error"])
+
 
 class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_invoke_returns_the_same_structured_contract(self):
@@ -148,6 +156,16 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(agent, "agent", FakeAgent()),
+            patch.object(
+                agent,
+                "_select_route",
+                return_value={
+                    "decision": None,
+                    "route_target": "fallback",
+                    "router_error": "test fallback",
+                    "fallback": True,
+                },
+            ),
             patch.object(agent.storage, "load", return_value=[]),
             patch.object(agent.storage, "save") as save,
         ):
