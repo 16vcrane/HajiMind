@@ -140,6 +140,7 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 - **工具可扩展**：天气查询示例 + 知识库检索，便于按需增添第三方 API 或企业数据源。
 - **统一 Tool Infrastructure**：所有工具通过 `ToolRegistry` 注册，继承 `BaseTool` 的输入校验、超时、重试、错误处理与执行 Trace；LangChain Agent 仍使用原有工具名称和文本输出契约。
 - **RAG 过程可观测**：记录检索、评分、重写与来源信息，前端可展开查看每一步细节。
+- **多文档冲突提示**：对不同来源中相同事实的相反结论保留全部证据，不强行选择单一答案；`rag_trace.conflict` 返回来源、观点、证据和可用时间信息。
 - **查询重写体系**：Step-Back 与 HyDE 两种扩展方式 + 路由选择，必要时触发重写检索。
 - **相关性评分门控**：基于结构化输出的 `grade_documents` 判断是否需要重写检索。
 - **实时思考链路展示**：通过 `asyncio` 事件循环穿透技术，实现 Agent 在执行 RAG、评分、重写等同步工具时，实时向前端推送思考步骤（Searching -> Grading -> Rewriting），彻底解决"静默思考"问题。
@@ -385,6 +386,8 @@ python -m eval.runner --dataset eval/datasets
 默认输出 `eval/reports/rag_eval_report.json` 和
 `eval/reports/rag_eval_report.csv`。评估器只基于 `gold_chunk_ids` 计算检索指标，
 不会凭空生成准确率。
+
+Phase 8 增加多文档冲突检测：RAG 在初次和扩展检索完成后，以可解释的事实主张比对不同来源。仅当相同主语/断言出现不同取值时，`rag_trace.conflict.has_conflict` 才为 `true`。系统不会自动裁决冲突；知识库工具会明确提示“知识库中存在来源冲突。”并提供来源、观点、证据和文档可用时间。
 
 ## 环境变量
 需在仓库根目录或运行环境配置：

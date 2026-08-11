@@ -98,6 +98,7 @@ class RagTrace(BaseModel):
     auto_merge_threshold: Optional[int] = None
     auto_merge_replaced_chunks: Optional[int] = None
     auto_merge_steps: Optional[int] = None
+    conflict: Optional[dict[str, Any]] = None
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None

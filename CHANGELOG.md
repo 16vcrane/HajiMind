@@ -15,3 +15,5 @@
   multimodal-ready image metadata support.
 - Added configurable BM25 parameters, Hybrid dense/sparse weights, sparse retrieval,
   and offline RAG retrieval/rerank evaluation with JSON/CSV reports.
+- Added explainable multi-document conflict detection to RAG traces and knowledge-base
+  tool output without automatically resolving conflicting source claims.

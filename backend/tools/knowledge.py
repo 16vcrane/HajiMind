@@ -43,10 +43,24 @@ class KnowledgeBaseTool(BaseTool):
         if not docs:
             return "No relevant documents found in the knowledge base."
 
+        conflict = rag_trace.get("conflict", {}) if isinstance(rag_trace, dict) else {}
         formatted = []
         for index, result in enumerate(docs, 1):
             source = result.get("filename", "Unknown")
             page = result.get("page_number", "N/A")
             text = result.get("text", "")
             formatted.append(f"[{index}] {source} (Page {page}):\n{text}")
-        return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)
+        response = "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)
+        if conflict.get("has_conflict"):
+            conflict_lines = ["知识库中存在来源冲突。"]
+            for claim in conflict.get("claims", [])[:6]:
+                conflict_lines.extend(
+                    [
+                        f"来源: {claim.get('source', 'Unknown')}",
+                        f"观点: {claim.get('claim', '')}",
+                        f"证据: {claim.get('evidence', '')}",
+                        f"时间: {claim.get('timestamp') or '未提供'}",
+                    ]
+                )
+            response += "\n\n" + "\n".join(conflict_lines)
+        return response
