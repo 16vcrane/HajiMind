@@ -195,6 +195,23 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
                         "task_results": {},
                         "completed_tasks": ["task_1"],
                         "failed_tasks": [],
+                        "tool_calls": [
+                            {
+                                "tool_name": "calendar_time",
+                                "status": "success",
+                                "latency_ms": 5,
+                                "result_count": None,
+                            }
+                        ],
+                        "task_traces": [
+                            {
+                                "task_id": "task_1",
+                                "description": "测试任务",
+                                "tool": "synthesis",
+                                "status": "completed",
+                                "latency_ms": 5,
+                            }
+                        ],
                         "execution_trace": [],
                     }
 
@@ -207,20 +224,23 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
                     "planner_started",
                     "task_created",
                     "task_started",
+                    "tool_start",
+                    "tool_result",
                     "task_completed",
                     "synthesis_started",
                 ):
-                    await event_handler(
-                        {
-                            "type": event_type,
-                            "label": event_type,
-                            "task": {
-                                "id": "task_1",
-                                "description": "测试任务",
-                                "tool": "synthesis",
-                            },
-                        }
-                    )
+                    event = {
+                        "type": event_type,
+                        "label": event_type,
+                        "task": {
+                            "id": "task_1",
+                            "description": "测试任务",
+                            "tool": "synthesis",
+                        },
+                    }
+                    if event_type.startswith("tool_"):
+                        event["tool_name"] = "calendar_time"
+                    await event_handler(event)
                 return FakePlannerResult()
 
         with (
@@ -248,8 +268,16 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         joined = "".join(events)
+        self.assertIn('"type": "agent_step"', joined)
+        self.assertIn('"type": "router_step"', joined)
+        self.assertIn('"type": "planner_step"', joined)
         self.assertIn('"type": "planner_started"', joined)
+        self.assertIn('"type": "tool_start"', joined)
+        self.assertIn('"type": "tool_result"', joined)
+        self.assertIn('"type": "task_start"', joined)
+        self.assertIn('"type": "task_result"', joined)
         self.assertIn('"type": "task_completed"', joined)
+        self.assertIn('"agent_trace"', joined)
         self.assertIn("planned answer", joined)
 
 

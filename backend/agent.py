@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 from typing import Any
 
@@ -13,6 +14,7 @@ from sqlalchemy import select, desc
 
 from auth import get_current_user
 from agent_planner import MultiStepPlanner, PlannerError
+from agent_observability import AgentTrace, monotonic_ms, new_request_id, utc_now_iso
 from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
@@ -312,6 +314,7 @@ def _get_routed_agent(route_target: str):
 
 
 def _select_route(user_text: str, messages: list) -> dict:
+    started_at = time.perf_counter()
     try:
         decision = router.decide(user_text, history=messages)
         route_target = resolve_route_target(decision)
@@ -320,6 +323,7 @@ def _select_route(user_text: str, messages: list) -> dict:
             "route_target": route_target,
             "router_error": None,
             "fallback": False,
+            "router_latency_ms": monotonic_ms(started_at),
         }
     except Exception as exc:
         return {
@@ -327,6 +331,7 @@ def _select_route(user_text: str, messages: list) -> dict:
             "route_target": "fallback",
             "router_error": str(exc),
             "fallback": True,
+            "router_latency_ms": monotonic_ms(started_at),
         }
 
 
@@ -347,6 +352,8 @@ def _router_trace(route_context: dict) -> dict:
         "execution_trace": route_context.get("execution_trace"),
         "planner_error": route_context.get("planner_error"),
         "planner_cancelled": route_context.get("planner_cancelled"),
+        "tool_calls": route_context.get("tool_calls"),
+        "task_traces": route_context.get("task_traces"),
     }
 
 
@@ -367,6 +374,8 @@ def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
                 "execution_trace": trace["execution_trace"],
                 "planner_error": trace["planner_error"],
                 "planner_cancelled": trace["planner_cancelled"],
+                "tool_calls": trace["tool_calls"],
+                "task_traces": trace["task_traces"],
             }
         )
         return merged
@@ -383,10 +392,61 @@ def _attach_planner_result(route_context: dict, planner_result) -> None:
             "completed_tasks": state.get("completed_tasks"),
             "failed_tasks": state.get("failed_tasks"),
             "execution_trace": state.get("execution_trace"),
+            "tool_calls": state.get("tool_calls"),
+            "task_traces": state.get("task_traces"),
             "planner_cancelled": planner_result.cancelled,
             "planner_error": planner_result.error,
         }
     )
+
+
+def _build_agent_trace(
+    *,
+    route_context: dict,
+    legacy_trace: dict,
+    request_id: str,
+    session_id: str,
+    user_id: int,
+    started_at: float,
+    final_status: str,
+) -> dict:
+    decision = route_context.get("decision")
+    errors = [
+        error
+        for error in (
+            route_context.get("router_error"),
+            route_context.get("planner_error"),
+        )
+        if error
+    ]
+    if final_status == "success" and route_context.get("failed_tasks"):
+        final_status = "partial_success"
+    rag_payload = legacy_trace.get("rag_trace")
+    if rag_payload is None and legacy_trace.get("tool_name") == "search_knowledge_base":
+        rag_payload = dict(legacy_trace)
+    agent_trace = AgentTrace(
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        intent=decision.intent if isinstance(decision, RouterDecision) else None,
+        complexity=decision.complexity if isinstance(decision, RouterDecision) else None,
+        route=route_context.get("route_target"),
+        plan=route_context.get("plan"),
+        tool_calls=route_context.get("tool_calls") or [],
+        rag_trace=rag_payload if isinstance(rag_payload, dict) else None,
+        task_results=route_context.get("task_results") or {},
+        task_traces=route_context.get("task_traces") or [],
+        latency={
+            "total_ms": monotonic_ms(started_at),
+            "router_ms": route_context.get("router_latency_ms"),
+        },
+        errors=errors,
+        final_status=final_status,
+    ).model_dump(mode="json")
+    merged = dict(legacy_trace)
+    merged.update(agent_trace)
+    merged["agent_trace"] = agent_trace
+    return merged
 
 
 def _decision_payload(route_context: dict) -> dict[str, Any] | None:
@@ -438,6 +498,8 @@ def _invoke_routed(route_context: dict, messages: list) -> str:
 
 
 def chat_with_agent(user_text: str, user_id: int, session_id: str):
+    request_started_at = time.perf_counter()
+    request_id = new_request_id()
     messages = storage.load(user_id, session_id)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
@@ -453,7 +515,16 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    agent_trace = _merge_agent_trace(route_context, rag_trace)
+    legacy_trace = _merge_agent_trace(route_context, rag_trace)
+    agent_trace = _build_agent_trace(
+        route_context=route_context,
+        legacy_trace=legacy_trace,
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        started_at=request_started_at,
+        final_status="success",
+    )
     extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": agent_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
 
@@ -461,6 +532,8 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
 
 
 async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
+    request_started_at = time.perf_counter()
+    request_id = new_request_id()
     messages = storage.load(user_id, session_id)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
@@ -477,12 +550,16 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
         summary = summarize_old_messages(model, messages[:40])
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
+    yield f"data: {json.dumps({'type': 'agent_step', 'request_id': request_id, 'label': 'request_started', 'timestamp': utc_now_iso()}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'label': '正在分析问题'}, ensure_ascii=False)}\n\n"
     yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': '正在分析问题', 'detail': ''}}, ensure_ascii=False)}\n\n"
     route_context = await asyncio.to_thread(_select_route, user_text, messages)
     decision = route_context.get("decision")
     if isinstance(decision, RouterDecision):
+        yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'intent': decision.intent, 'complexity': decision.complexity, 'route': route_context['route_target'], 'reason': decision.reason}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': decision.intent, 'detail': decision.reason}}, ensure_ascii=False)}\n\n"
     elif route_context.get("router_error"):
+        yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'route': 'fallback', 'error': route_context['router_error']}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '⚠️', 'label': 'Router 失败，回退现有 Agent', 'detail': route_context['router_error']}}, ensure_ascii=False)}\n\n"
     yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '➡️', 'label': route_label(route_context['route_target']), 'detail': ''}}, ensure_ascii=False)}\n\n"
 
@@ -523,7 +600,16 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
             if route_target == "planner":
                 async def _planner_event_handler(event):
+                    await output_queue.put({**event, "type": "planner_step"})
                     await output_queue.put({"type": event["type"], **event})
+                    if event["type"] == "task_started":
+                        await output_queue.put({**event, "type": "task_start"})
+                    elif event["type"] in ("task_completed", "task_failed"):
+                        await output_queue.put({**event, "type": "task_result"})
+                    elif event["type"] == "tool_start":
+                        await output_queue.put({**event, "type": "tool_start"})
+                    elif event["type"] == "tool_result":
+                        await output_queue.put({**event, "type": "tool_result"})
                     await output_queue.put({"type": "rag_step", "step": _planner_step(event)})
 
                 try:
@@ -613,9 +699,21 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    agent_trace = _merge_agent_trace(route_context, rag_trace)
+    legacy_trace = _merge_agent_trace(route_context, rag_trace)
+    final_status = "cancelled" if route_context.get("planner_cancelled") else "success"
+    if route_context.get("router_error") or route_context.get("planner_error"):
+        final_status = "error" if route_context.get("planner_error") else final_status
+    agent_trace = _build_agent_trace(
+        route_context=route_context,
+        legacy_trace=legacy_trace,
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        started_at=request_started_at,
+        final_status=final_status,
+    )
     if agent_trace:
-        yield f"data: {json.dumps({'type': 'trace', 'rag_trace': agent_trace}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'trace', 'agent_trace': agent_trace.get('agent_trace'), 'rag_trace': agent_trace}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
     messages.append(AIMessage(content=full_response))

@@ -43,6 +43,19 @@ class RetrievedChunk(BaseModel):
 class RagTrace(BaseModel):
     tool_used: bool
     tool_name: str
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[int] = None
+    intent: Optional[str] = None
+    complexity: Optional[str] = None
+    route: Optional[str] = None
+    tool_calls: Optional[List[dict[str, Any]]] = None
+    rag_trace: Optional[dict[str, Any]] = None
+    task_traces: Optional[List[dict[str, Any]]] = None
+    latency: Optional[dict[str, Any]] = None
+    errors: Optional[List[str]] = None
+    final_status: Optional[str] = None
+    agent_trace: Optional[dict[str, Any]] = None
     router_decision: Optional[dict[str, Any]] = None
     route_target: Optional[str] = None
     router_error: Optional[str] = None

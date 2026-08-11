@@ -322,6 +322,34 @@ Streaming 会实时发送 `planner_started`、`task_created`、`task_started`、
 `task_completed`、`task_failed`、`parallel_execution_started` 和
 `synthesis_started`。前端同时把这些事件映射到现有思考气泡中的步骤展示。
 
+Phase 5 将原有 RAG Trace 扩展为完整 Agent Trace，并保留旧字段兼容。最终
+`trace` SSE 事件同时返回 `agent_trace` 和兼容字段 `rag_trace`。Agent Trace
+包含：
+- `request_id`、`session_id`、`user_id`
+- `intent`、`complexity`、`route`
+- `plan`
+- `tool_calls`
+- `rag_trace`
+- `task_results`、`task_traces`
+- `latency`
+- `errors`
+- `final_status`
+
+每个 Tool 和 Planner Task 只记录工程摘要：`start_time`、`end_time`、
+`latency_ms`、`status`、`input_summary`、`output_summary` 和 `error`。摘要会过滤
+API Key、token、password、secret 等敏感字段，不默认保存完整输入输出。
+
+Streaming 现在同时支持新的观测事件：`agent_step`、`router_step`、
+`planner_step`、`tool_start`、`tool_result`、`task_start`、`task_result`、
+`trace`、`content`、`error` 和 `[DONE]`；旧的 `rag_step`、`planner_started`、
+`task_created`、`task_started`、`task_completed`、`task_failed`、
+`parallel_execution_started`、`synthesis_started` 仍保留兼容。
+
+前端新增 Agent Workflow Panel，展示 User Question → Router → Planner →
+Tool/RAG → Synthesis → Final Answer 的工程状态。Tool 节点展示名称、状态、
+latency 和 result count；RAG 节点展示 Dense、BM25、RRF、Rerank 状态，不展示
+模型内部 chain-of-thought。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`

@@ -12,6 +12,16 @@ from typing import Any, Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, model_validator
 
+from agent_observability import (
+    TaskExecutionTrace,
+    ToolCallTrace,
+    monotonic_ms,
+    sanitize_value,
+    summarize_value,
+    task_trace_from_task,
+    tool_call_from_result,
+    utc_now_iso,
+)
 from tools import ToolRegistry
 from tools.models import ToolResult, ToolStatus
 
@@ -94,6 +104,8 @@ class PlannerState(BaseModel):
     task_results: dict[str, Any] = Field(default_factory=dict)
     completed_tasks: list[str] = Field(default_factory=list)
     failed_tasks: list[str] = Field(default_factory=list)
+    tool_calls: list[ToolCallTrace] = Field(default_factory=list)
+    task_traces: list[TaskExecutionTrace] = Field(default_factory=list)
     execution_trace: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -233,6 +245,8 @@ class TaskExecutor:
         self.cancel_event = cancel_event or asyncio.Event()
         self.active_tasks: set[asyncio.Task] = set()
         self.state = PlannerState()
+        self._task_started_at: dict[str, float] = {}
+        self._task_start_time: dict[str, str] = {}
 
     async def execute(self, plan: Plan, user_text: str) -> PlannerRunResult:
         self.state.plan = plan
@@ -257,8 +271,16 @@ class TaskExecutor:
                     task.status = TaskStatus.SKIPPED
                     task.error = "dependency failed"
                     self.state.failed_tasks.append(task.id)
+                    self._task_start_time[task.id] = utc_now_iso()
+                    self.state.task_traces.append(self._task_trace(task, ended=True))
                     self._trace(task, "task_failed", error=task.error)
-                    await self._emit("task_failed", "任务失败", task=task.model_dump(), error=task.error)
+                    await self._emit(
+                        "task_failed",
+                        "任务失败",
+                        task=task.model_dump(),
+                        error=task.error,
+                        task_trace=self.state.task_traces[-1].model_dump(mode="json"),
+                    )
                     pending.pop(task.id)
 
                 ready = [task for task in ready if task.id in pending]
@@ -305,8 +327,15 @@ class TaskExecutor:
         self._raise_if_cancelled()
         task.status = TaskStatus.RUNNING
         self.state.current_task = task.id
+        self._task_started_at[task.id] = time.perf_counter()
+        self._task_start_time[task.id] = utc_now_iso()
         self._trace(task, "task_started")
-        await self._emit("task_started", "任务开始", task=task.model_dump())
+        await self._emit(
+            "task_started",
+            "任务开始",
+            task=task.model_dump(),
+            task_trace=self._task_trace(task).model_dump(mode="json"),
+        )
 
         attempts = 0
         while attempts <= task.max_retries:
@@ -324,13 +353,20 @@ class TaskExecutor:
                 task.status = TaskStatus.COMPLETED
                 self.state.task_results[task.id] = result
                 self.state.completed_tasks.append(task.id)
+                self.state.task_traces.append(self._task_trace(task, ended=True))
                 self._trace(task, "task_completed")
-                await self._emit("task_completed", "任务完成", task=task.model_dump())
+                await self._emit(
+                    "task_completed",
+                    "任务完成",
+                    task=task.model_dump(),
+                    task_trace=self.state.task_traces[-1].model_dump(mode="json"),
+                )
                 return
             except asyncio.CancelledError as exc:
                 task.status = TaskStatus.CANCELLED
                 task.error = "cancelled"
                 self.state.failed_tasks.append(task.id)
+                self.state.task_traces.append(self._task_trace(task, ended=True))
                 self._trace(task, "task_failed", error=task.error)
                 raise PlannerCancelled() from exc
             except asyncio.TimeoutError:
@@ -342,6 +378,7 @@ class TaskExecutor:
                 task.status = TaskStatus.CANCELLED
                 task.error = "cancelled"
                 self.state.failed_tasks.append(task.id)
+                self.state.task_traces.append(self._task_trace(task, ended=True))
                 self._trace(task, "task_failed", error=task.error)
                 raise
             except Exception as exc:
@@ -357,7 +394,29 @@ class TaskExecutor:
 
         tool_name = self._resolve_tool_name(task.tool)
         payload = self._build_tool_input(task, user_text)
+        tool_started_at = time.perf_counter()
+        tool_start_time = utc_now_iso()
+        await self._emit(
+            "tool_start",
+            "工具开始",
+            task_id=task.id,
+            tool_name=tool_name,
+            input_summary=sanitize_value(payload),
+            start_time=tool_start_time,
+        )
         result: ToolResult = await self.tool_registry.async_execute(tool_name, **payload)
+        tool_trace = tool_call_from_result(result, payload)
+        tool_trace.start_time = tool_start_time
+        tool_trace.end_time = utc_now_iso()
+        tool_trace.latency_ms = monotonic_ms(tool_started_at)
+        self.state.tool_calls.append(tool_trace)
+        await self._emit(
+            "tool_result",
+            "工具完成",
+            task_id=task.id,
+            tool_name=tool_name,
+            tool_trace=tool_trace.model_dump(mode="json"),
+        )
         if result.status != ToolStatus.SUCCESS:
             raise PlannerError(result.error or f"{tool_name} 执行失败")
         return {
@@ -413,8 +472,15 @@ class TaskExecutor:
         task.status = TaskStatus.FAILED
         task.error = error
         self.state.failed_tasks.append(task.id)
+        self.state.task_traces.append(self._task_trace(task, ended=True))
         self._trace(task, "task_failed", error=error)
-        await self._emit("task_failed", "任务失败", task=task.model_dump(), error=error)
+        await self._emit(
+            "task_failed",
+            "任务失败",
+            task=task.model_dump(),
+            error=error,
+            task_trace=self.state.task_traces[-1].model_dump(mode="json"),
+        )
 
     def _build_tool_input(self, task: Task, user_text: str) -> dict[str, Any]:
         if task.input:
@@ -491,6 +557,17 @@ class TaskExecutor:
                 **extra,
             }
         )
+
+    def _task_trace(self, task: Task, *, ended: bool = False) -> TaskExecutionTrace:
+        started_at = self._task_started_at.get(task.id)
+        trace = task_trace_from_task(task, started_at=started_at)
+        trace.start_time = self._task_start_time.get(task.id)
+        if ended:
+            trace.end_time = utc_now_iso()
+        trace.input_summary = sanitize_value(task.input)
+        trace.output_summary = summarize_value(task.result)
+        trace.latency_ms = monotonic_ms(started_at) if started_at is not None else None
+        return trace
 
     async def _emit(self, event_type: str, label: str, **payload: Any) -> None:
         if not self.event_handler:

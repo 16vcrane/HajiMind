@@ -93,6 +93,12 @@ class PlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.state.completed_tasks, ["task_1"])
         self.assertIn("calendar_time result", result.response)
         self.assertEqual(calls[0][0], "calendar_time")
+        self.assertEqual(result.state.task_traces[0].status, "completed")
+        self.assertIsNotNone(result.state.task_traces[0].start_time)
+        self.assertIsNotNone(result.state.task_traces[0].end_time)
+        self.assertGreaterEqual(result.state.task_traces[0].latency_ms, 0)
+        self.assertEqual(result.state.tool_calls[0].tool_name, "calendar_time")
+        self.assertEqual(result.state.tool_calls[0].status, "success")
 
     async def test_serial_dependencies_execute_in_order(self):
         calls = []
