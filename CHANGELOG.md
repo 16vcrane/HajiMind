@@ -11,3 +11,7 @@
 - Added Agent reliability controls: bounded tool/task retries, exponential backoff,
   circuit breaking, maximum agent steps, loop detection, and recovery traces.
 - Added Planner recovery for repeated tasks and failed web search fallback to RAG.
+- Added structure-aware document parsing and semantic chunking with code, table, and
+  multimodal-ready image metadata support.
+- Added configurable BM25 parameters, Hybrid dense/sparse weights, sparse retrieval,
+  and offline RAG retrieval/rerank evaluation with JSON/CSV reports.

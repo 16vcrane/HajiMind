@@ -371,6 +371,21 @@ Call、重复 Query、重复 Planner Task、Planner 无进展和连续工具失�
 稳定实时结果的用户可见说明。恢复状态写入 `recovery_attempts` 和
 `recovery_events`，不包含 API Key 或完整敏感负载。
 
+Phase 7 增加 RAG Deep Engineering：
+- 文档优先按 Heading、Paragraph、List、Code、Table、Image 解析，失败时回退 Recursive Character Splitter。
+- 结构块先按约 2000-3000 token 聚合，再按语义边界切成约 512-1024 token；代码块保持完整。
+- Table 转换为结构化文本；Image 保存 caption、source、周边文本和 `multimodal_embedding=false`，当前不伪装支持多模态 embedding。
+- BM25 支持 `k1` / `b`，Hybrid 支持 dense/sparse 权重和 RRF/WeightedRanker。
+- `eval/datasets/` 支持真实 gold 标注与 LLM synthetic 数据，输出 Recall@K、Precision@K、MRR、NDCG、Hit Rate。
+
+运行离线评估：
+```bash
+python -m eval.runner --dataset eval/datasets
+```
+默认输出 `eval/reports/rag_eval_report.json` 和
+`eval/reports/rag_eval_report.csv`。评估器只基于 `gold_chunk_ids` 计算检索指标，
+不会凭空生成准确率。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`
@@ -384,6 +399,8 @@ Call、重复 Query、重复 Planner Task、Planner 无进展和连续工具失�
   `RETRY_BACKOFF_MAX_SECONDS`、`STUCK_REPEAT_THRESHOLD`、
   `CIRCUIT_BREAKER_ENABLED`、`CIRCUIT_BREAKER_FAILURE_THRESHOLD`、
   `CIRCUIT_BREAKER_RESET_SECONDS`
+- RAG Retrieval：`BM25_K1`、`BM25_B`、`HYBRID_DENSE_WEIGHT`、
+  `HYBRID_SPARSE_WEIGHT`、`HYBRID_RRF_K`
 
 ## API 速览
 - `POST /auth/register`：注册并返回 JWT；首个注册用户自动成为管理员。

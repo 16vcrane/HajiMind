@@ -140,6 +140,10 @@ def retrieve_initial(state: RAGState) -> RAGState:
         "rerank_error": retrieve_meta.get("rerank_error"),
         "retrieval_mode": retrieve_meta.get("retrieval_mode"),
         "candidate_k": retrieve_meta.get("candidate_k"),
+        "dense_weight": retrieve_meta.get("dense_weight"),
+        "sparse_weight": retrieve_meta.get("sparse_weight"),
+        "bm25_k1": retrieve_meta.get("bm25_k1"),
+        "bm25_b": retrieve_meta.get("bm25_b"),
         "leaf_retrieve_level": retrieve_meta.get("leaf_retrieve_level"),
         "auto_merge_enabled": retrieve_meta.get("auto_merge_enabled"),
         "auto_merge_applied": retrieve_meta.get("auto_merge_applied"),
@@ -253,6 +257,10 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     rerank_errors = []
     retrieval_mode = None
     candidate_k = None
+    dense_weight = None
+    sparse_weight = None
+    bm25_k1 = None
+    bm25_b = None
     leaf_retrieve_level = None
     auto_merge_enabled = None
     auto_merge_applied = False
@@ -282,6 +290,10 @@ def retrieve_expanded(state: RAGState) -> RAGState:
             rerank_errors.append(f"hyde:{hyde_meta.get('rerank_error')}")
         retrieval_mode = retrieval_mode or hyde_meta.get("retrieval_mode")
         candidate_k = candidate_k or hyde_meta.get("candidate_k")
+        dense_weight = dense_weight if dense_weight is not None else hyde_meta.get("dense_weight")
+        sparse_weight = sparse_weight if sparse_weight is not None else hyde_meta.get("sparse_weight")
+        bm25_k1 = bm25_k1 if bm25_k1 is not None else hyde_meta.get("bm25_k1")
+        bm25_b = bm25_b if bm25_b is not None else hyde_meta.get("bm25_b")
         leaf_retrieve_level = leaf_retrieve_level or hyde_meta.get("leaf_retrieve_level")
         auto_merge_enabled = auto_merge_enabled if auto_merge_enabled is not None else hyde_meta.get("auto_merge_enabled")
         auto_merge_applied = auto_merge_applied or bool(hyde_meta.get("auto_merge_applied"))
@@ -311,6 +323,10 @@ def retrieve_expanded(state: RAGState) -> RAGState:
             rerank_errors.append(f"step_back:{step_meta.get('rerank_error')}")
         retrieval_mode = retrieval_mode or step_meta.get("retrieval_mode")
         candidate_k = candidate_k or step_meta.get("candidate_k")
+        dense_weight = dense_weight if dense_weight is not None else step_meta.get("dense_weight")
+        sparse_weight = sparse_weight if sparse_weight is not None else step_meta.get("sparse_weight")
+        bm25_k1 = bm25_k1 if bm25_k1 is not None else step_meta.get("bm25_k1")
+        bm25_b = bm25_b if bm25_b is not None else step_meta.get("bm25_b")
         leaf_retrieve_level = leaf_retrieve_level or step_meta.get("leaf_retrieve_level")
         auto_merge_enabled = auto_merge_enabled if auto_merge_enabled is not None else step_meta.get("auto_merge_enabled")
         auto_merge_applied = auto_merge_applied or bool(step_meta.get("auto_merge_applied"))
@@ -351,6 +367,10 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         "rerank_error": "; ".join(rerank_errors) if rerank_errors else None,
         "retrieval_mode": retrieval_mode,
         "candidate_k": candidate_k,
+        "dense_weight": dense_weight,
+        "sparse_weight": sparse_weight,
+        "bm25_k1": bm25_k1,
+        "bm25_b": bm25_b,
         "leaf_retrieve_level": leaf_retrieve_level,
         "auto_merge_enabled": auto_merge_enabled,
         "auto_merge_applied": auto_merge_applied,

@@ -88,6 +88,10 @@ class RagTrace(BaseModel):
     rerank_error: Optional[str] = None
     retrieval_mode: Optional[str] = None
     candidate_k: Optional[int] = None
+    dense_weight: Optional[float] = None
+    sparse_weight: Optional[float] = None
+    bm25_k1: Optional[float] = None
+    bm25_b: Optional[float] = None
     leaf_retrieve_level: Optional[int] = None
     auto_merge_enabled: Optional[bool] = None
     auto_merge_applied: Optional[bool] = None

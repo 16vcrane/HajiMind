@@ -21,6 +21,11 @@ RERANK_API_KEY = os.getenv("RERANK_API_KEY")
 AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "true").lower() != "false"
 AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
 LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))
+BM25_K1 = float(os.getenv("BM25_K1", "1.5"))
+BM25_B = float(os.getenv("BM25_B", "0.75"))
+HYBRID_DENSE_WEIGHT = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.5"))
+HYBRID_SPARSE_WEIGHT = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.5"))
+HYBRID_RRF_K = int(os.getenv("HYBRID_RRF_K", "60"))
 
 # 全局初始化检索依赖，避免反复构造
 _embedding_service = EmbeddingService()
@@ -106,10 +111,16 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
     }
 
 
-def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
+def _rerank_documents(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    enabled: bool = True,
+) -> Tuple[List[dict], Dict[str, Any]]:
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
-        "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+        "rerank_enabled": enabled and bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
         "rerank_applied": False,
         "rerank_model": RERANK_MODEL,
         "rerank_endpoint": _get_rerank_endpoint(),
@@ -162,6 +173,18 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
     except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
         meta["rerank_error"] = str(e)
         return docs_with_rank[:top_k], meta
+
+
+def _dedupe_docs(docs: List[dict]) -> List[dict]:
+    deduped: List[dict] = []
+    seen = set()
+    for item in docs:
+        key = item.get("chunk_id") or (item.get("filename"), item.get("page_number"), item.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _get_stepback_model():
@@ -243,9 +266,42 @@ def step_back_expand(query: str) -> dict:
     }
 
 
-def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
-    candidate_k = max(top_k * 3, top_k)
-    filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
+def _search_dense(query: str, candidate_k: int, filter_expr: str) -> tuple[List[dict], Dict[str, Any]]:
+    try:
+        dense_embeddings = _embedding_service.get_embeddings([query])
+        dense_embedding = dense_embeddings[0]
+        retrieved = _milvus_manager.dense_retrieve(
+            dense_embedding=dense_embedding,
+            top_k=candidate_k,
+            filter_expr=filter_expr,
+        )
+        return retrieved, {"retrieval_mode": "dense"}
+    except Exception as exc:
+        return [], {"retrieval_mode": "dense_failed", "retrieval_error": str(exc)}
+
+
+def _search_sparse(query: str, candidate_k: int, filter_expr: str) -> tuple[List[dict], Dict[str, Any]]:
+    try:
+        sparse_embedding = _embedding_service.get_sparse_embedding(query)
+        retrieved = _milvus_manager.sparse_retrieve(
+            sparse_embedding=sparse_embedding,
+            top_k=candidate_k,
+            filter_expr=filter_expr,
+        )
+        return retrieved, {"retrieval_mode": "bm25"}
+    except Exception as exc:
+        return [], {"retrieval_mode": "bm25_failed", "retrieval_error": str(exc)}
+
+
+def _search_hybrid(
+    query: str,
+    candidate_k: int,
+    filter_expr: str,
+    *,
+    dense_weight: float,
+    sparse_weight: float,
+    ranker_type: str,
+) -> tuple[List[dict], Dict[str, Any]]:
     try:
         dense_embeddings = _embedding_service.get_embeddings([query])
         dense_embedding = dense_embeddings[0]
@@ -255,48 +311,161 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
             dense_embedding=dense_embedding,
             sparse_embedding=sparse_embedding,
             top_k=candidate_k,
+            rrf_k=HYBRID_RRF_K,
             filter_expr=filter_expr,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
+            ranker_type=ranker_type,
         )
-        reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
-        merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-        rerank_meta["retrieval_mode"] = "hybrid"
-        rerank_meta["candidate_k"] = candidate_k
-        rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
-        rerank_meta.update(merge_meta)
-        return {"docs": merged_docs, "meta": rerank_meta}
-    except Exception:
-        try:
-            dense_embeddings = _embedding_service.get_embeddings([query])
-            dense_embedding = dense_embeddings[0]
-            retrieved = _milvus_manager.dense_retrieve(
-                dense_embedding=dense_embedding,
-                top_k=candidate_k,
-                filter_expr=filter_expr,
+        return retrieved, {
+            "retrieval_mode": "hybrid" if ranker_type == "rrf" else "hybrid_weighted",
+        }
+    except Exception as exc:
+        return [], {"retrieval_mode": "hybrid_failed", "retrieval_error": str(exc)}
+
+
+def _finalize_retrieval(
+    query: str,
+    docs: List[dict],
+    top_k: int,
+    *,
+    retrieval_mode: str,
+    rerank_enabled: bool = True,
+) -> Dict[str, Any]:
+    reranked, rerank_meta = _rerank_documents(query=query, docs=docs, top_k=top_k, enabled=rerank_enabled)
+    merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
+    rerank_meta["retrieval_mode"] = retrieval_mode
+    rerank_meta["candidate_k"] = len(docs)
+    rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
+    rerank_meta.update(merge_meta)
+    rerank_meta["deduped_count"] = len(_dedupe_docs(docs))
+    return {"docs": merged_docs, "meta": rerank_meta}
+
+
+def retrieve_documents(
+    query: str,
+    top_k: int = 5,
+    *,
+    retrieval_mode: str = "hybrid",
+    candidate_k: int | None = None,
+    rerank_enabled: bool = True,
+    dense_weight: float | None = None,
+    sparse_weight: float | None = None,
+    bm25_k1: float | None = None,
+    bm25_b: float | None = None,
+) -> Dict[str, Any]:
+    candidate_k = candidate_k or max(top_k * 3, top_k)
+    dense_weight = HYBRID_DENSE_WEIGHT if dense_weight is None else dense_weight
+    sparse_weight = HYBRID_SPARSE_WEIGHT if sparse_weight is None else sparse_weight
+    filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
+    _embedding_service.k1 = float(bm25_k1 if bm25_k1 is not None else BM25_K1)
+    _embedding_service.b = float(bm25_b if bm25_b is not None else BM25_B)
+
+    if retrieval_mode == "dense":
+        docs, meta = _search_dense(query, candidate_k, filter_expr)
+        if not docs:
+            meta.update({
+                "rerank_enabled": False,
+                "rerank_applied": False,
+                "rerank_model": RERANK_MODEL,
+                "rerank_endpoint": _get_rerank_endpoint(),
+                "candidate_k": candidate_k,
+                "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+                "auto_merge_enabled": AUTO_MERGE_ENABLED,
+                "auto_merge_applied": False,
+                "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
+                "auto_merge_replaced_chunks": 0,
+                "auto_merge_steps": 0,
+                "candidate_count": 0,
+            })
+            return {"docs": [], "meta": meta}
+        result = _finalize_retrieval(query, docs, top_k, retrieval_mode="dense", rerank_enabled=rerank_enabled)
+        result["meta"]["rerank_enabled"] = False
+        if not rerank_enabled:
+            result["meta"]["rerank_applied"] = False
+        return result
+
+    if retrieval_mode == "bm25":
+        docs, meta = _search_sparse(query, candidate_k, filter_expr)
+        if not docs:
+            meta.update({
+                "rerank_enabled": False,
+                "rerank_applied": False,
+                "rerank_model": RERANK_MODEL,
+                "rerank_endpoint": _get_rerank_endpoint(),
+                "candidate_k": candidate_k,
+                "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+                "auto_merge_enabled": AUTO_MERGE_ENABLED,
+                "auto_merge_applied": False,
+                "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
+                "auto_merge_replaced_chunks": 0,
+                "auto_merge_steps": 0,
+                "candidate_count": 0,
+            })
+            return {"docs": [], "meta": meta}
+        result = _finalize_retrieval(query, docs, top_k, retrieval_mode="bm25", rerank_enabled=rerank_enabled)
+        result["meta"]["rerank_enabled"] = False
+        if not rerank_enabled:
+            result["meta"]["rerank_applied"] = False
+        return result
+
+    ranker_type = "weighted" if retrieval_mode == "hybrid_weighted" else "rrf"
+    docs, meta = _search_hybrid(
+        query,
+        candidate_k,
+        filter_expr,
+        dense_weight=dense_weight,
+        sparse_weight=sparse_weight,
+        ranker_type=ranker_type,
+    )
+    if not docs:
+        fallback_docs, fallback_meta = _search_dense(query, candidate_k, filter_expr)
+        if fallback_docs:
+            result = _finalize_retrieval(
+                query,
+                fallback_docs,
+                top_k,
+                retrieval_mode="dense_fallback",
+                rerank_enabled=rerank_enabled,
             )
-            reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
-            merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-            rerank_meta["retrieval_mode"] = "dense_fallback"
-            rerank_meta["candidate_k"] = candidate_k
-            rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
-            rerank_meta.update(merge_meta)
-            return {"docs": merged_docs, "meta": rerank_meta}
-        except Exception:
-            return {
-                "docs": [],
-                "meta": {
-                    "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
-                    "rerank_applied": False,
-                    "rerank_model": RERANK_MODEL,
-                    "rerank_endpoint": _get_rerank_endpoint(),
-                    "rerank_error": "retrieve_failed",
-                    "retrieval_mode": "failed",
-                    "candidate_k": candidate_k,
-                    "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
-                    "auto_merge_enabled": AUTO_MERGE_ENABLED,
-                    "auto_merge_applied": False,
-                    "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
-                    "auto_merge_replaced_chunks": 0,
-                    "auto_merge_steps": 0,
-                    "candidate_count": 0,
-                },
-            }
+            result["meta"]["fallback_from"] = meta.get("retrieval_mode")
+            result["meta"]["dense_weight"] = dense_weight
+            result["meta"]["sparse_weight"] = sparse_weight
+            result["meta"]["bm25_k1"] = _embedding_service.k1
+            result["meta"]["bm25_b"] = _embedding_service.b
+            return result
+        meta.update({
+            "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST) and rerank_enabled,
+            "rerank_applied": False,
+            "rerank_model": RERANK_MODEL,
+            "rerank_endpoint": _get_rerank_endpoint(),
+            "candidate_k": candidate_k,
+            "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+            "auto_merge_enabled": AUTO_MERGE_ENABLED,
+            "auto_merge_applied": False,
+            "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
+            "auto_merge_replaced_chunks": 0,
+            "auto_merge_steps": 0,
+            "candidate_count": 0,
+            "dense_weight": dense_weight,
+            "sparse_weight": sparse_weight,
+            "bm25_k1": _embedding_service.k1,
+            "bm25_b": _embedding_service.b,
+        })
+        return {"docs": [], "meta": meta}
+
+    result = _finalize_retrieval(
+        query,
+        docs,
+        top_k,
+        retrieval_mode=meta["retrieval_mode"],
+        rerank_enabled=rerank_enabled,
+    )
+    result["meta"]["dense_weight"] = dense_weight
+    result["meta"]["sparse_weight"] = sparse_weight
+    result["meta"]["bm25_k1"] = _embedding_service.k1
+    result["meta"]["bm25_b"] = _embedding_service.b
+    if not rerank_enabled:
+        result["meta"]["rerank_enabled"] = False
+        result["meta"]["rerank_applied"] = False
+    return result
