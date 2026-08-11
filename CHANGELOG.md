@@ -8,3 +8,6 @@
 - Added Planner streaming events for task lifecycle visibility.
 - Added unified Agent Trace with Router, Planner, Tool, Task, RAG, latency, error, and final status observability.
 - Added Agent Workflow Panel for frontend trace visualization.
+- Added Agent reliability controls: bounded tool/task retries, exponential backoff,
+  circuit breaking, maximum agent steps, loop detection, and recovery traces.
+- Added Planner recovery for repeated tasks and failed web search fallback to RAG.

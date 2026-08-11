@@ -73,6 +73,18 @@ BAIDU_SEARCH_API_KEY=your_baidu_search_api_key
 BAIDU_SEARCH_API_URL=https://your-baidu-search-provider-endpoint
 DEFAULT_TIMEZONE=UTC
 
+# ===== Agent Reliability =====
+MAX_TOOL_RETRIES=2
+MAX_TASK_RETRIES=2
+MAX_AGENT_STEPS=24
+MAX_RECOVERY_ATTEMPTS=3
+RETRY_BACKOFF_SECONDS=0.25
+RETRY_BACKOFF_MAX_SECONDS=2.0
+STUCK_REPEAT_THRESHOLD=3
+CIRCUIT_BREAKER_ENABLED=true
+CIRCUIT_BREAKER_FAILURE_THRESHOLD=3
+CIRCUIT_BREAKER_RESET_SECONDS=30
+
 ```
 
 ### 4) Docker 部署（Milvus 向量库）
@@ -350,6 +362,15 @@ Tool/RAG → Synthesis → Final Answer 的工程状态。Tool 节点展示名�
 latency 和 result count；RAG 节点展示 Dense、BM25、RRF、Rerank 状态，不展示
 模型内部 chain-of-thought。
 
+Phase 6 增加 Agent Reliability。`BaseTool` 的 timeout、retry 与指数退避受
+`MAX_TOOL_RETRIES` 约束；`ToolRegistry` 对连续失败工具启用 Circuit Breaker。
+Planner 对任务 retry、执行步数和 recovery 次数分别受 `MAX_TASK_RETRIES`、
+`MAX_AGENT_STEPS`、`MAX_RECOVERY_ATTEMPTS` 约束。执行 Trace 会检测重复 Tool
+Call、重复 Query、重复 Planner Task、Planner 无进展和连续工具失败；恢复顺序为：
+修改 Query、降低 `top_k`、Web Search 回退至 RAG、跳过当前任务，最后返回无法获得
+稳定实时结果的用户可见说明。恢复状态写入 `recovery_attempts` 和
+`recovery_events`，不包含 API Key 或完整敏感负载。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`
@@ -358,6 +379,11 @@ latency 和 result count；RAG 节点展示 Dense、BM25、RRF、Rerank 状态�
 - Auto-merging：`AUTO_MERGE_ENABLED`、`AUTO_MERGE_THRESHOLD`、`LEAF_RETRIEVE_LEVEL`
 - 工具：`AMAP_WEATHER_API`、`AMAP_API_KEY`、`BAIDU_SEARCH_API_KEY`、
   `BAIDU_SEARCH_API_URL`、`DEFAULT_TIMEZONE`
+- Agent Reliability：`MAX_TOOL_RETRIES`、`MAX_TASK_RETRIES`、
+  `MAX_AGENT_STEPS`、`MAX_RECOVERY_ATTEMPTS`、`RETRY_BACKOFF_SECONDS`、
+  `RETRY_BACKOFF_MAX_SECONDS`、`STUCK_REPEAT_THRESHOLD`、
+  `CIRCUIT_BREAKER_ENABLED`、`CIRCUIT_BREAKER_FAILURE_THRESHOLD`、
+  `CIRCUIT_BREAKER_RESET_SECONDS`
 
 ## API 速览
 - `POST /auth/register`：注册并返回 JWT；首个注册用户自动成为管理员。

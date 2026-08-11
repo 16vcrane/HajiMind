@@ -60,6 +60,8 @@ class AgentTrace(BaseModel):
     rag_trace: dict[str, Any] | None = None
     task_results: dict[str, Any] = Field(default_factory=dict)
     task_traces: list[TaskExecutionTrace] = Field(default_factory=list)
+    recovery_attempts: int = 0
+    recovery_events: list[dict[str, Any]] = Field(default_factory=list)
     latency: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     final_status: str = "running"

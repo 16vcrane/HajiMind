@@ -15,6 +15,7 @@ from sqlalchemy import select, desc
 from auth import get_current_user
 from agent_planner import MultiStepPlanner, PlannerError
 from agent_observability import AgentTrace, monotonic_ms, new_request_id, utc_now_iso
+from agent_reliability import get_reliability_config
 from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
@@ -354,6 +355,8 @@ def _router_trace(route_context: dict) -> dict:
         "planner_cancelled": route_context.get("planner_cancelled"),
         "tool_calls": route_context.get("tool_calls"),
         "task_traces": route_context.get("task_traces"),
+        "recovery_attempts": route_context.get("recovery_attempts"),
+        "recovery_events": route_context.get("recovery_events"),
     }
 
 
@@ -376,6 +379,8 @@ def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
                 "planner_cancelled": trace["planner_cancelled"],
                 "tool_calls": trace["tool_calls"],
                 "task_traces": trace["task_traces"],
+                "recovery_attempts": trace["recovery_attempts"],
+                "recovery_events": trace["recovery_events"],
             }
         )
         return merged
@@ -396,6 +401,8 @@ def _attach_planner_result(route_context: dict, planner_result) -> None:
             "task_traces": state.get("task_traces"),
             "planner_cancelled": planner_result.cancelled,
             "planner_error": planner_result.error,
+            "recovery_attempts": state.get("recovery_attempts"),
+            "recovery_events": state.get("recovery_events"),
         }
     )
 
@@ -436,6 +443,8 @@ def _build_agent_trace(
         rag_trace=rag_payload if isinstance(rag_payload, dict) else None,
         task_results=route_context.get("task_results") or {},
         task_traces=route_context.get("task_traces") or [],
+        recovery_attempts=route_context.get("recovery_attempts") or 0,
+        recovery_events=route_context.get("recovery_events") or [],
         latency={
             "total_ms": monotonic_ms(started_at),
             "router_ms": route_context.get("router_latency_ms"),
@@ -469,9 +478,10 @@ def _planner_step(event: dict[str, Any]) -> dict[str, str]:
 
 
 def _invoke_routed(route_context: dict, messages: list) -> str:
+    max_agent_steps = get_reliability_config().max_agent_steps
     route_target = route_context["route_target"]
     if route_context.get("fallback"):
-        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
     if route_target == "planner":
         try:
             planner_result = planner.run_sync(
@@ -484,16 +494,16 @@ def _invoke_routed(route_context: dict, messages: list) -> str:
             route_context["planner_error"] = str(exc)
             route_context["route_target"] = "fallback"
             route_context["fallback"] = True
-            return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+            return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
     if route_target == "llm":
         return _response_to_text(
             model.invoke([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages)
         )
     selected_agent = _get_routed_agent(route_target)
     if selected_agent is None:
-        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
     return _response_to_text(
-        selected_agent.invoke({"messages": messages}, config={"recursion_limit": 10})
+        selected_agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps})
     )
 
 
@@ -570,13 +580,14 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
     async def _agent_worker():
         nonlocal full_response
         try:
+            max_agent_steps = get_reliability_config().max_agent_steps
             route_target = route_context["route_target"]
             if route_context.get("fallback"):
                 selected_agent = agent
                 async for msg, metadata in selected_agent.astream(
                     {"messages": messages},
                     stream_mode="messages",
-                    config={"recursion_limit": 8},
+                    config={"recursion_limit": max_agent_steps},
                 ):
                     if not isinstance(msg, AIMessageChunk):
                         continue
@@ -643,7 +654,7 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
                     async for msg, metadata in selected_agent.astream(
                         {"messages": messages},
                         stream_mode="messages",
-                        config={"recursion_limit": 8},
+                        config={"recursion_limit": max_agent_steps},
                     ):
                         if not isinstance(msg, AIMessageChunk):
                             continue
@@ -661,7 +672,7 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
             async for msg, metadata in selected_agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
-                config={"recursion_limit": 10},
+                config={"recursion_limit": max_agent_steps},
             ):
                 if not isinstance(msg, AIMessageChunk):
                     continue

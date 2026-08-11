@@ -127,7 +127,11 @@ class PlannerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response, "synthesized answer")
         self.assertEqual(result.state.completed_tasks, ["task_1", "task_2"])
-        task_events = [event["event"] for event in result.state.execution_trace]
+        task_events = [
+            event["event"]
+            for event in result.state.execution_trace
+            if event["event"] in {"task_started", "task_completed", "task_failed"}
+        ]
         self.assertEqual(
             task_events,
             ["task_started", "task_completed", "task_started", "task_completed"],

@@ -52,6 +52,8 @@ class RagTrace(BaseModel):
     tool_calls: Optional[List[dict[str, Any]]] = None
     rag_trace: Optional[dict[str, Any]] = None
     task_traces: Optional[List[dict[str, Any]]] = None
+    recovery_attempts: Optional[int] = None
+    recovery_events: Optional[List[dict[str, Any]]] = None
     latency: Optional[dict[str, Any]] = None
     errors: Optional[List[str]] = None
     final_status: Optional[str] = None

@@ -10,6 +10,8 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ValidationError
 
+from agent_reliability import get_reliability_config, retry_delay_seconds
+
 from .errors import ToolExecutionError, ToolTimeoutError
 from .models import ToolExecutionTrace, ToolResult, ToolStatus
 
@@ -49,16 +51,18 @@ class BaseTool(ABC):
                 metadata={"error_type": "validation_error"},
             )
 
+        config = get_reliability_config()
+        max_retries = min(self.max_retries, config.max_tool_retries)
         attempts = 0
         last_error: ToolExecutionError | None = None
-        while attempts <= self.max_retries:
+        while attempts <= max_retries:
             attempts += 1
             try:
                 data = self._invoke_with_timeout(validated)
                 return self._success_result(started_at, data, attempts)
             except ToolExecutionError as exc:
                 last_error = exc
-                if not exc.retryable or attempts > self.max_retries:
+                if not exc.retryable or attempts > max_retries:
                     status = ToolStatus.TIMEOUT if isinstance(exc, ToolTimeoutError) else ToolStatus.ERROR
                     return self._error_result(
                         started_at,
@@ -77,7 +81,7 @@ class BaseTool(ABC):
                     metadata={"error_type": type(exc).__name__},
                 )
 
-            time.sleep(self.retry_backoff_seconds * (2 ** (attempts - 1)))
+            time.sleep(retry_delay_seconds(self.retry_backoff_seconds, attempts))
 
         return self._error_result(
             started_at,
@@ -106,7 +110,7 @@ class BaseTool(ABC):
             "name": self.name,
             "available": True,
             "timeout_seconds": self.timeout_seconds,
-            "max_retries": self.max_retries,
+            "max_retries": min(self.max_retries, get_reliability_config().max_tool_retries),
         }
 
     @abstractmethod
