@@ -194,8 +194,9 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 ## 目录与架构
 - 后端：`backend/`
   - [app.py](backend/app.py)：FastAPI 入口、CORS、静态资源挂载。
-  - [api.py](backend/api.py)：聊天、会话管理、文档管理接口。
+  - [api.py](backend/api.py)：聊天、会话、记忆与文档管理接口。
   - [agent.py](backend/agent.py)：LangChain Agent、会话存储、摘要逻辑。
+  - [memory.py](backend/memory.py)：工作记忆、会话记忆、长期记忆和偏好记忆的提取、过滤、CRUD 与提示词注入。
   - `tools/`：统一工具基础设施与工具实现。
     - `base.py`：`BaseTool`，统一输入校验、超时、重试、错误结果和 LangChain 适配。
     - `registry.py`：`ToolRegistry`，负责注册、查询、健康状态和 LangChain Tool 列表。
@@ -389,6 +390,13 @@ python -m eval.runner --dataset eval/datasets
 
 Phase 8 增加多文档冲突检测：RAG 在初次和扩展检索完成后，以可解释的事实主张比对不同来源。仅当相同主语/断言出现不同取值时，`rag_trace.conflict.has_conflict` 才为 `true`。系统不会自动裁决冲突；知识库工具会明确提示“知识库中存在来源冲突。”并提供来源、观点、证据和文档可用时间。
 
+Phase 8 同时增加结构化 Memory：
+- Working Memory：仅在当前请求内保存问题、路由与已检索记忆，不落库。
+- Conversation Memory：继续使用现有 `ChatSession` / `ChatMessage` 保存会话历史。
+- Long-term Memory / Preference Memory：写入 PostgreSQL `user_memories`，按用户隔离，并支持创建、读取、更新、删除。
+- 自动提取只接受稳定偏好、个人背景和长期目标；一次性问题、临时任务、提醒、API Key、密码、Token、Secret 等敏感信息会被拒绝。
+- `AgentTrace.memory` 和兼容字段 `memory_trace` 只记录工程摘要，例如已检索/新建记忆 ID、会话消息数和跳过原因，不保存 API Key 或敏感原文。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`
@@ -397,6 +405,7 @@ Phase 8 增加多文档冲突检测：RAG 在初次和扩展检索完成后，�
 - Auto-merging：`AUTO_MERGE_ENABLED`、`AUTO_MERGE_THRESHOLD`、`LEAF_RETRIEVE_LEVEL`
 - 工具：`AMAP_WEATHER_API`、`AMAP_API_KEY`、`BAIDU_SEARCH_API_KEY`、
   `BAIDU_SEARCH_API_URL`、`DEFAULT_TIMEZONE`
+- Memory：`MEMORY_MAX_RETRIEVED`（单次 Agent 请求最多注入的长期记忆数量，默认 `6`）
 - Agent Reliability：`MAX_TOOL_RETRIES`、`MAX_TASK_RETRIES`、
   `MAX_AGENT_STEPS`、`MAX_RECOVERY_ATTEMPTS`、`RETRY_BACKOFF_SECONDS`、
   `RETRY_BACKOFF_MAX_SECONDS`、`STUCK_REPEAT_THRESHOLD`、
@@ -414,6 +423,10 @@ Phase 8 增加多文档冲突检测：RAG 在初次和扩展检索完成后，�
 - `GET /sessions`：列出当前用户的会话。
 - `GET /sessions/{session_id}`：拉取当前用户的会话消息。
 - `DELETE /sessions/{session_id}`：删除当前用户的会话。
+- `GET /memories`：列出当前用户的长期记忆或偏好记忆，可按 `query`、`memory_type` 过滤。
+- `POST /memories`：创建一条 `long_term` 或 `preference` 记忆。
+- `PATCH /memories/{memory_id}`：更新当前用户的一条持久化记忆。
+- `DELETE /memories/{memory_id}`：删除当前用户的一条持久化记忆。
 - `GET /documents`：管理员列出已入库文档及 chunk 数。
 - `POST /documents/upload`：管理员上传并向量化 PDF/Word。
 - `DELETE /documents/{filename}`：管理员删除指定文档的向量数据。

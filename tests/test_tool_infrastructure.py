@@ -168,6 +168,12 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(agent.storage, "load", return_value=[]),
             patch.object(agent.storage, "save") as save,
+            patch.object(agent.memory_service, "retrieve", return_value=[]),
+            patch.object(
+                agent.memory_service,
+                "extract_and_store",
+                return_value=types.SimpleNamespace(memory_ids=[], skipped_reasons=[]),
+            ),
         ):
             events = [
                 event
@@ -257,6 +263,12 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(agent.storage, "load", return_value=[]),
             patch.object(agent.storage, "save"),
+            patch.object(agent.memory_service, "retrieve", return_value=[]),
+            patch.object(
+                agent.memory_service,
+                "extract_and_store",
+                return_value=types.SimpleNamespace(memory_ids=[], skipped_reasons=[]),
+            ),
         ):
             events = [
                 event

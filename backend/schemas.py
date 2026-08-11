@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Any
 
 
@@ -99,6 +99,7 @@ class RagTrace(BaseModel):
     auto_merge_replaced_chunks: Optional[int] = None
     auto_merge_steps: Optional[int] = None
     conflict: Optional[dict[str, Any]] = None
+    memory_trace: Optional[dict[str, Any]] = None
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None
@@ -155,4 +156,40 @@ class DocumentUploadResponse(BaseModel):
 class DocumentDeleteResponse(BaseModel):
     filename: str
     chunks_deleted: int
+    message: str
+
+
+class MemoryCreateRequest(BaseModel):
+    content: str
+    memory_type: str = "long_term"
+    key: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    memory_type: Optional[str] = None
+    key: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class MemoryInfo(BaseModel):
+    id: int
+    user_id: int
+    memory_type: str
+    key: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_session_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    last_accessed_at: Optional[str] = None
+
+
+class MemoryListResponse(BaseModel):
+    memories: List[MemoryInfo]
+
+
+class MemoryDeleteResponse(BaseModel):
+    id: int
     message: str

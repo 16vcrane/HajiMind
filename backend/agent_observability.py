@@ -58,6 +58,7 @@ class AgentTrace(BaseModel):
     plan: dict[str, Any] | None = None
     tool_calls: list[ToolCallTrace] = Field(default_factory=list)
     rag_trace: dict[str, Any] | None = None
+    memory: dict[str, Any] = Field(default_factory=dict)
     task_results: dict[str, Any] = Field(default_factory=dict)
     task_traces: list[TaskExecutionTrace] = Field(default_factory=list)
     recovery_attempts: int = 0

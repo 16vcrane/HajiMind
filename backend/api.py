@@ -22,6 +22,7 @@ from document_loader import DocumentLoader
 from embedding import EmbeddingService
 from milvus_client import MilvusManager
 from milvus_writer import MilvusWriter
+from memory import MemoryPolicyError, MemoryService
 from models import ChatSession, User
 from parent_chunk_store import ParentChunkStore
 from schemas import (
@@ -32,6 +33,11 @@ from schemas import (
     DocumentListResponse,
     DocumentUploadResponse,
     LoginRequest,
+    MemoryCreateRequest,
+    MemoryDeleteResponse,
+    MemoryInfo,
+    MemoryListResponse,
+    MemoryUpdateRequest,
     MessageInfo,
     RegisterRequest,
     SessionDeleteResponse,
@@ -51,6 +57,7 @@ parent_chunk_store = ParentChunkStore()
 milvus_manager = MilvusManager()
 embedding_service = EmbeddingService()
 milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
+memory_service = MemoryService()
 
 router = APIRouter()
 
@@ -150,6 +157,84 @@ async def delete_session(session_id: str, current_user: User = Depends(get_curre
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/memories", response_model=MemoryListResponse)
+async def list_memories(
+    query: str | None = None,
+    memory_type: str | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        records = memory_service.retrieve(
+            current_user.id,
+            query=query,
+            memory_type=memory_type,
+            limit=50,
+        )
+        return MemoryListResponse(memories=[MemoryInfo(**record) for record in records])
+    except MemoryPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve memories: {exc}")
+
+
+@router.post("/memories", response_model=MemoryInfo)
+async def create_memory(
+    request: MemoryCreateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = memory_service.create(
+            current_user.id,
+            content=request.content,
+            memory_type=request.memory_type,
+            key=request.key,
+            metadata=request.metadata,
+        )
+        return MemoryInfo(**record)
+    except MemoryPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create memory: {exc}")
+
+
+@router.patch("/memories/{memory_id}", response_model=MemoryInfo)
+async def update_memory(
+    memory_id: int,
+    request: MemoryUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = memory_service.update(
+            current_user.id,
+            memory_id,
+            content=request.content,
+            memory_type=request.memory_type,
+            key=request.key,
+            metadata=request.metadata,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="Memory not found.")
+        return MemoryInfo(**record)
+    except MemoryPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update memory: {exc}")
+
+
+@router.delete("/memories/{memory_id}", response_model=MemoryDeleteResponse)
+async def delete_memory(memory_id: int, current_user: User = Depends(get_current_user)):
+    try:
+        if not memory_service.delete(current_user.id, memory_id):
+            raise HTTPException(status_code=404, detail="Memory not found.")
+        return MemoryDeleteResponse(id=memory_id, message="Memory deleted.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {exc}")
 
 
 def _model_error(exc: Exception) -> HTTPException:

@@ -17,3 +17,5 @@
   and offline RAG retrieval/rerank evaluation with JSON/CSV reports.
 - Added explainable multi-document conflict detection to RAG traces and knowledge-base
   tool output without automatically resolving conflicting source claims.
+- Added structured working, conversation, long-term, and preference memory with
+  privacy-aware extraction, user-isolated PostgreSQL CRUD, and Agent Trace integration.

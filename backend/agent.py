@@ -19,6 +19,7 @@ from agent_reliability import get_reliability_config
 from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
+from memory import MemoryService, memory_prompt
 from models import ChatMessage, ChatSession, User
 from tools import (
     get_agent_tools,
@@ -259,6 +260,7 @@ router = AgentRouter(model)
 planner = MultiStepPlanner(model=model, tool_registry=tool_registry)
 _routed_agents = {}
 storage = ConversationStorage()
+memory_service = MemoryService()
 
 
 def summarize_old_messages(model, messages: list) -> str:
@@ -357,6 +359,7 @@ def _router_trace(route_context: dict) -> dict:
         "task_traces": route_context.get("task_traces"),
         "recovery_attempts": route_context.get("recovery_attempts"),
         "recovery_events": route_context.get("recovery_events"),
+        "memory_trace": route_context.get("memory_trace"),
     }
 
 
@@ -381,6 +384,7 @@ def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
                 "task_traces": trace["task_traces"],
                 "recovery_attempts": trace["recovery_attempts"],
                 "recovery_events": trace["recovery_events"],
+                "memory_trace": trace["memory_trace"],
             }
         )
         return merged
@@ -441,6 +445,7 @@ def _build_agent_trace(
         plan=route_context.get("plan"),
         tool_calls=route_context.get("tool_calls") or [],
         rag_trace=rag_payload if isinstance(rag_payload, dict) else None,
+        memory=route_context.get("memory_trace") or {},
         task_results=route_context.get("task_results") or {},
         task_traces=route_context.get("task_traces") or [],
         recovery_attempts=route_context.get("recovery_attempts") or 0,
@@ -454,8 +459,47 @@ def _build_agent_trace(
     ).model_dump(mode="json")
     merged = dict(legacy_trace)
     merged.update(agent_trace)
+    merged["memory_trace"] = route_context.get("memory_trace") or {}
     merged["agent_trace"] = agent_trace
     return merged
+
+
+def _prepare_memory_context(
+    user_id: int,
+    user_text: str,
+    conversation_message_count: int,
+) -> tuple[SystemMessage | None, dict]:
+    memory_trace = {
+        "working_memory_used": True,
+        "conversation_message_count": conversation_message_count,
+        "retrieved_memory_ids": [],
+        "extracted_memory_ids": [],
+        "skipped_reasons": [],
+    }
+    try:
+        records = memory_service.retrieve(user_id, query=user_text)
+    except Exception:
+        memory_trace["skipped_reasons"].append("memory_retrieval_unavailable")
+        return None, memory_trace
+
+    memory_trace["retrieved_memory_ids"] = [record["id"] for record in records]
+    prompt = memory_prompt(records)
+    return (SystemMessage(content=prompt) if prompt else None), memory_trace
+
+
+def _extract_long_term_memory(
+    memory_trace: dict,
+    *,
+    user_id: int,
+    user_text: str,
+    session_id: str,
+) -> None:
+    try:
+        result = memory_service.extract_and_store(user_id, user_text, session_id)
+        memory_trace["extracted_memory_ids"] = result.memory_ids
+        memory_trace["skipped_reasons"].extend(result.skipped_reasons)
+    except Exception:
+        memory_trace["skipped_reasons"].append("memory_extraction_unavailable")
 
 
 def _decision_payload(route_context: dict) -> dict[str, Any] | None:
@@ -510,7 +554,8 @@ def _invoke_routed(route_context: dict, messages: list) -> str:
 def chat_with_agent(user_text: str, user_id: int, session_id: str):
     request_started_at = time.perf_counter()
     request_id = new_request_id()
-    messages = storage.load(user_id, session_id)
+    persisted_messages = storage.load(user_id, session_id)
+    messages = list(persisted_messages)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
 
@@ -519,9 +564,23 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
     route_context = _select_route(user_text, messages)
+    memory_message, memory_trace = _prepare_memory_context(
+        user_id,
+        user_text,
+        len(persisted_messages),
+    )
+    route_context["memory_trace"] = memory_trace
+    if memory_message:
+        messages.insert(0, memory_message)
     messages.append(HumanMessage(content=user_text))
     response_content = _invoke_routed(route_context, messages)
     messages.append(AIMessage(content=response_content))
+    _extract_long_term_memory(
+        memory_trace,
+        user_id=user_id,
+        user_text=user_text,
+        session_id=session_id,
+    )
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
@@ -535,8 +594,9 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
         started_at=request_started_at,
         final_status="success",
     )
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": agent_trace}]
-    storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
+    persisted_messages.extend([HumanMessage(content=user_text), AIMessage(content=response_content)])
+    extra_message_data = [None] * (len(persisted_messages) - 1) + [{"rag_trace": agent_trace}]
+    storage.save(user_id, session_id, persisted_messages, extra_message_data=extra_message_data)
 
     return {"response": response_content, "rag_trace": agent_trace}
 
@@ -544,7 +604,8 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
 async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
     request_started_at = time.perf_counter()
     request_id = new_request_id()
-    messages = storage.load(user_id, session_id)
+    persisted_messages = storage.load(user_id, session_id)
+    messages = list(persisted_messages)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
 
@@ -564,6 +625,15 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
     yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'label': '正在分析问题'}, ensure_ascii=False)}\n\n"
     yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': '正在分析问题', 'detail': ''}}, ensure_ascii=False)}\n\n"
     route_context = await asyncio.to_thread(_select_route, user_text, messages)
+    memory_message, memory_trace = await asyncio.to_thread(
+        _prepare_memory_context,
+        user_id,
+        user_text,
+        len(persisted_messages),
+    )
+    route_context["memory_trace"] = memory_trace
+    if memory_message:
+        messages.insert(0, memory_message)
     decision = route_context.get("decision")
     if isinstance(decision, RouterDecision):
         yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'intent': decision.intent, 'complexity': decision.complexity, 'route': route_context['route_target'], 'reason': decision.reason}, ensure_ascii=False)}\n\n"
@@ -710,6 +780,12 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
+    _extract_long_term_memory(
+        memory_trace,
+        user_id=user_id,
+        user_text=user_text,
+        session_id=session_id,
+    )
     legacy_trace = _merge_agent_trace(route_context, rag_trace)
     final_status = "cancelled" if route_context.get("planner_cancelled") else "success"
     if route_context.get("router_error") or route_context.get("planner_error"):
@@ -727,6 +803,6 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
         yield f"data: {json.dumps({'type': 'trace', 'agent_trace': agent_trace.get('agent_trace'), 'rag_trace': agent_trace}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
-    messages.append(AIMessage(content=full_response))
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": agent_trace}]
-    storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
+    persisted_messages.extend([HumanMessage(content=user_text), AIMessage(content=full_response)])
+    extra_message_data = [None] * (len(persisted_messages) - 1) + [{"rag_trace": agent_trace}]
+    storage.save(user_id, session_id, persisted_messages, extra_message_data=extra_message_data)
