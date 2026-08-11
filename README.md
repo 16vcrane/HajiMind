@@ -123,6 +123,7 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 - **三级分块 + Auto-merging**：L1/L2/L3 三层滑窗切分；检索时优先召回 L3，满足阈值后自动合并到父块（L3->L2->L1）。
 - **Leaf-only 向量化存储**：仅叶子分块写入 Milvus，父块写入 DocStore，减少向量冗余并保留上下文聚合能力。
 - **工具可扩展**：天气查询示例 + 知识库检索，便于按需增添第三方 API 或企业数据源。
+- **统一 Tool Infrastructure**：所有工具通过 `ToolRegistry` 注册，继承 `BaseTool` 的输入校验、超时、重试、错误处理与执行 Trace；LangChain Agent 仍使用原有工具名称和文本输出契约。
 - **RAG 过程可观测**：记录检索、评分、重写与来源信息，前端可展开查看每一步细节。
 - **查询重写体系**：Step-Back 与 HyDE 两种扩展方式 + 路由选择，必要时触发重写检索。
 - **相关性评分门控**：基于结构化输出的 `grade_documents` 判断是否需要重写检索。
@@ -179,7 +180,11 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
   - [app.py](backend/app.py)：FastAPI 入口、CORS、静态资源挂载。
   - [api.py](backend/api.py)：聊天、会话管理、文档管理接口。
   - [agent.py](backend/agent.py)：LangChain Agent、会话存储、摘要逻辑。
-  - [tools.py](backend/tools.py)：天气查询、知识库检索工具。
+  - `tools/`：统一工具基础设施与工具实现。
+    - `base.py`：`BaseTool`，统一输入校验、超时、重试、错误结果和 LangChain 适配。
+    - `registry.py`：`ToolRegistry`，负责注册、查询、健康状态和 LangChain Tool 列表。
+    - `models.py`：`ToolResult`、`ToolExecutionTrace`、`ToolStatus`。
+    - `weather.py` / `knowledge.py`：现有天气与知识库工具的兼容迁移。
   - [embedding.py](backend/embedding.py)：稠密向量 API 调用 + BM25 稀疏向量生成。
   - [document_loader.py](backend/document_loader.py)：PDF/Word 加载与分片。
   - [parent_chunk_store.py](backend/parent_chunk_store.py)：父级分块 DocStore（用于 Auto-merging 回取父块）。
@@ -250,6 +255,17 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 - 前端：Vue 3 (CDN)、marked、highlight.js、纯静态部署。
 - 工具链：dotenv 配置、requests、langchain_text_splitters、langchain_community.loaders。
 
+## Tool Architecture
+
+当前 Agent 通过 `ToolRegistry` 获取 `get_current_weather` 和
+`search_knowledge_base` 两个 LangChain Tool。每次工具执行都会生成统一的
+`ToolResult` 与 `ToolExecutionTrace`，包含 `tool_name`、`status`、
+`latency_ms`、`attempts` 和 `error`。Agent 仍接收原有的文本工具结果，
+因此聊天 API、Streaming API 与 SSE 事件协议保持不变。
+
+后续 Baidu Search、Calendar / Time、Life Service、SQL Assistant 等工具应继承
+`BaseTool` 并通过同一个 Registry 注册，不应直接向 Agent 工具列表追加临时函数。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`
@@ -314,7 +330,7 @@ FastAPI 运行在单线程的 asyncio Event Loop 上。为了不阻塞主线程�
     `call_soon_threadsafe` 是 asyncio 唯一允许从其他线程向 Loop 注入回调的方法。它相当于向主 Loop 的"待办事项箱"投递了一个任务（即 `queue.put_nowait`），主 Loop 会在下一次 tick 立即执行它，从而实现数据的平滑流转。
 
 ```python
-# 核心代码摘要 (tools.py)
+# 核心代码摘要 (tools/context.py)
 def set_rag_step_queue(queue):
     global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
     _RAG_STEP_QUEUE = queue
@@ -387,7 +403,7 @@ chat_with_agent_stream()
 - 过滤 `tool_call_chunks`，只转发文本内容给前端。
 - **关键设计**：Agent 流式循环运行在 `asyncio.create_task` 后台任务中，主生成器只负责从统一 `output_queue` 取事件并 yield。这样 RAG 步骤在工具执行期间（agent 阻塞等待工具返回时）仍然可以实时推送到前端。
 
-#### 2) 实时 RAG 步骤推送 (`tools.py` + `rag_pipeline.py`)
+#### 2) 实时 RAG 步骤推送 (`tools/context.py` + `rag_pipeline.py`)
 - `emit_rag_step(icon, label, detail)` 通过 `asyncio.get_event_loop().call_soon_threadsafe()` 将步骤从同步线程安全地推送到异步队列。
 - `_RagStepProxy` 代理对象将原始 step dict 包装为 `{"type": "rag_step", "step": {...}}` 后放入统一输出队列，**无需额外 relay 任务**。
 - `rag_pipeline.py` 在每个关键节点发射步骤：
@@ -470,7 +486,7 @@ StreamingResponse(
 ### 2026-02-19 RAG 实时思考链路修复
 - **问题**：Agent 在执行同步工具（如 `search_knowledge_base`）时，由于运行在线程池中，无法正确获取主线程的 asyncio 事件循环，导致 `emit_rag_step` 事件丢失，前端"思考中"气泡一直静止。
 - **修复**：
-  1. **Backend (`tools.py`)**：在 `set_rag_step_queue` 中显式捕获主线程的 `loop`。
-  2. **Backend (`tools.py`)**：更新 `emit_rag_step` 使用捕获的 `_RAG_STEP_LOOP.call_soon_threadsafe` 跨线程调度事件。
+  1. **Backend (`tools/context.py`)**：在 `set_rag_step_queue` 中显式捕获主线程的 `loop`。
+  2. **Backend (`tools/context.py`)**：更新 `emit_rag_step` 使用捕获的 `_RAG_STEP_LOOP.call_soon_threadsafe` 跨线程调度事件。
   3. **Frontend (`script.js`)**：在发送消息时初始化空的 `ragSteps: []` 数组，确保 Vue 响应式系统能立即追踪后续的 push 操作。
 - **效果**：用户提问后，思考气泡内实时跳动显示检索步骤（如"🔍 正在检索知识库..." -> "📊 正在评估文档相关性..."），不再只有静态的"正在思考中..."。

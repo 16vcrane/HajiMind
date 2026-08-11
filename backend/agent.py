@@ -15,11 +15,10 @@ from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
 from models import ChatMessage, ChatSession, User
 from tools import (
-    get_current_weather,
+    get_agent_tools,
     get_last_rag_context,
     reset_tool_call_guards,
     set_rag_step_queue,
-    search_knowledge_base,
 )
 
 load_dotenv()
@@ -175,7 +174,7 @@ def create_agent_instance():
 
     agent = create_agent(
         model=model,
-        tools=[get_current_weather, search_knowledge_base],
+        tools=get_agent_tools(),
         system_prompt=(
             "You are a cute cat bot that loves to help users. "
             "When responding, you may use tools to assist. "
