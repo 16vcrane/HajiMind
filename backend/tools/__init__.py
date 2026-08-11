@@ -1,4 +1,6 @@
 from .base import BaseTool
+from .baidu_search import BaiduSearchTool
+from .calendar_time import CalendarTimeTool
 from .context import (
     emit_rag_step,
     get_last_rag_context,
@@ -7,6 +9,7 @@ from .context import (
 )
 from .errors import ToolExecutionError, ToolTimeoutError
 from .knowledge import KnowledgeBaseTool
+from .life_service import LifeServiceTool
 from .models import ToolExecutionTrace, ToolResult, ToolStatus
 from .registry import ToolRegistry
 from .weather import WeatherTool
@@ -14,6 +17,9 @@ from .weather import WeatherTool
 tool_registry = ToolRegistry()
 tool_registry.register(WeatherTool())
 tool_registry.register(KnowledgeBaseTool())
+tool_registry.register(BaiduSearchTool())
+tool_registry.register(LifeServiceTool())
+tool_registry.register(CalendarTimeTool())
 
 
 def get_agent_tools():
@@ -29,7 +35,10 @@ search_knowledge_base = tool_registry.get("search_knowledge_base").as_langchain_
 
 __all__ = [
     "BaseTool",
+    "BaiduSearchTool",
+    "CalendarTimeTool",
     "KnowledgeBaseTool",
+    "LifeServiceTool",
     "ToolExecutionError",
     "ToolExecutionTrace",
     "ToolRegistry",

@@ -69,6 +69,9 @@ MILVUS_PORT=19530
 # ===== Tools （可选）=====
 AMAP_WEATHER_API=https://restapi.amap.com/v3/weather/weatherInfo
 AMAP_API_KEY=your_amap_api_key
+BAIDU_SEARCH_API_KEY=your_baidu_search_api_key
+BAIDU_SEARCH_API_URL=https://your-baidu-search-provider-endpoint
+DEFAULT_TIMEZONE=UTC
 
 ```
 
@@ -266,13 +269,32 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 后续 Baidu Search、Calendar / Time、Life Service、SQL Assistant 等工具应继承
 `BaseTool` 并通过同一个 Registry 注册，不应直接向 Agent 工具列表追加临时函数。
 
+Phase 2 已注册 `baidu_search`、`life_service` 和 `calendar_time`，它们都会生成
+统一 Trace，但尚未加入 `get_agent_tools()`。当前 Agent 仍仅暴露
+`get_current_weather` 和 `search_knowledge_base`，以保持现有 Agent 选择行为、
+聊天 API、Streaming API 和 SSE 协议不变。
+
+- `life_service`：支持 `current_weather` 与 `forecast`，复用已有
+  `AMAP_WEATHER_API` / `AMAP_API_KEY` 兼容逻辑；后续可扩展 POI、交通和餐饮。
+- `calendar_time`：支持当前时间、日期差、加减天数、星期计算和时区转换；
+  可使用 `Asia/Shanghai`、`Asia/Singapore` 和 `UTC`，默认时区由
+  `DEFAULT_TIMEZONE` 配置，未配置时回退至 `UTC`。
+- `baidu_search`：支持 `query` 和 `top_k`，结果标准化为 `title`、`url`、
+  `snippet`、`source`、`published_at` 和 `rank`。项目当前没有百度搜索供应商的
+  API 契约，因此工具仅接受已注入的 Provider Adapter，不会猜测认证头、请求参数
+  或响应字段并发送线上请求。
+
+要启用真实百度搜索 Provider Adapter，需要确认并提供：接口 URL、认证方式、
+请求参数或请求体格式，以及一份成功响应 JSON 示例（含搜索结果字段）。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`
 - Rerank 相关：`RERANK_MODEL`、`RERANK_BINDING_HOST`、`RERANK_API_KEY`
 - Milvus：`MILVUS_HOST`、`MILVUS_PORT`、`MILVUS_COLLECTION`
 - Auto-merging：`AUTO_MERGE_ENABLED`、`AUTO_MERGE_THRESHOLD`、`LEAF_RETRIEVE_LEVEL`
-- 工具：`AMAP_WEATHER_API`、`AMAP_API_KEY`
+- 工具：`AMAP_WEATHER_API`、`AMAP_API_KEY`、`BAIDU_SEARCH_API_KEY`、
+  `BAIDU_SEARCH_API_URL`、`DEFAULT_TIMEZONE`
 
 ## API 速览
 - `POST /auth/register`：注册并返回 JWT；首个注册用户自动成为管理员。
