@@ -256,6 +256,18 @@
                                 <div v-if="msg.ragTrace.router_error" class="trace-line">
                                     Router回退：{{ msg.ragTrace.router_error }}
                                 </div>
+                                <div v-if="msg.ragTrace.plan && msg.ragTrace.plan.tasks" class="trace-line">
+                                    Plan任务数：{{ msg.ragTrace.plan.tasks.length }}
+                                </div>
+                                <div v-if="msg.ragTrace.completed_tasks && msg.ragTrace.completed_tasks.length" class="trace-line">
+                                    已完成任务：{{ msg.ragTrace.completed_tasks.join(', ') }}
+                                </div>
+                                <div v-if="msg.ragTrace.failed_tasks && msg.ragTrace.failed_tasks.length" class="trace-line">
+                                    失败任务：{{ msg.ragTrace.failed_tasks.join(', ') }}
+                                </div>
+                                <div v-if="msg.ragTrace.planner_error" class="trace-line">
+                                    Planner状态：{{ msg.ragTrace.planner_error }}
+                                </div>
                                 <div class="trace-line">
                                     工具：{{ msg.ragTrace.tool_used ? msg.ragTrace.tool_name : '未使用' }}
                                 </div>

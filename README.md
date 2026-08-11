@@ -301,6 +301,27 @@ Phase 3 引入 Agent Router。Router 使用结构化 LLM Output 生成
 Router 失败时自动回退到旧 Agent。Router 分析过程通过现有 `rag_step` SSE
 事件展示，最终 `RouterDecision` 会写入 Agent Trace；未新增 SSE 事件类型。
 
+Phase 4 引入真正的 Multi-step Planner。Router 判定为 `planner` 后会进入
+`MultiStepPlanner`，由结构化 LLM Output 生成 `Plan`，再由 `TaskExecutor`
+按依赖图执行任务。Planner State 会写入 Agent Trace：
+- `plan`
+- `current_task`
+- `task_results`
+- `completed_tasks`
+- `failed_tasks`
+- `execution_trace`
+
+执行规则：
+- 无依赖任务会以同一批次并行执行，例如 Baidu Search、RAG、Calendar。
+- 有依赖任务会等待依赖全部完成后串行进入下一批次。
+- 每个任务记录 `status`、`result`、`error` 和 `attempts`。
+- 任务支持 retry、timeout；依赖失败时下游任务会标记失败/跳过。
+- 用户 Abort 时会设置 Planner cancellation，并取消仍在等待中的任务。
+
+Streaming 会实时发送 `planner_started`、`task_created`、`task_started`、
+`task_completed`、`task_failed`、`parallel_execution_started` 和
+`synthesis_started`。前端同时把这些事件映射到现有思考气泡中的步骤展示。
+
 ## 环境变量
 需在仓库根目录或运行环境配置：
 - 模型相关：`ARK_API_KEY`、`MODEL`、`BASE_URL`、`EMBEDDER`

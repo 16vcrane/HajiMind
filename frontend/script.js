@@ -95,6 +95,18 @@ createApp({
         parseMarkdown(text) {
             return marked.parse(text);
         },
+
+        isPlannerEvent(type) {
+            return [
+                'planner_started',
+                'task_created',
+                'task_started',
+                'task_completed',
+                'task_failed',
+                'parallel_execution_started',
+                'synthesis_started'
+            ].includes(type);
+        },
         
         escapeHtml(text) {
             const div = document.createElement('div');
@@ -149,7 +161,8 @@ createApp({
                 isUser: false, 
                 isThinking: true, 
                 ragTrace: null,
-                ragSteps: [] 
+                ragSteps: [],
+                plannerEvents: []
             });
             const botMsgIdx = this.messages.length - 1;
 
@@ -200,6 +213,11 @@ createApp({
                                         this.messages[botMsgIdx].ragSteps = [];
                                     }
                                     this.messages[botMsgIdx].ragSteps.push(data.step);
+                                } else if (this.isPlannerEvent(data.type)) {
+                                    if (!this.messages[botMsgIdx].plannerEvents) {
+                                        this.messages[botMsgIdx].plannerEvents = [];
+                                    }
+                                    this.messages[botMsgIdx].plannerEvents.push(data);
                                 } else if (data.type === 'error') {
                                     this.messages[botMsgIdx].isThinking = false;
                                     this.messages[botMsgIdx].text += `\n[Error: ${data.content}]`;

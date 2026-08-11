@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import HTTPException
@@ -11,6 +12,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from sqlalchemy import select, desc
 
 from auth import get_current_user
+from agent_planner import MultiStepPlanner, PlannerError
 from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
@@ -84,6 +86,16 @@ ROUTED_TOOL_NAMES = {
         "life_service",
         "calendar_time",
     ),
+}
+
+PLANNER_EVENT_ICONS = {
+    "planner_started": "🧩",
+    "task_created": "○",
+    "task_started": "●",
+    "task_completed": "✓",
+    "task_failed": "×",
+    "parallel_execution_started": "↔",
+    "synthesis_started": "◆",
 }
 
 
@@ -241,6 +253,7 @@ def create_agent_instance():
 
 agent, model = create_agent_instance()
 router = AgentRouter(model)
+planner = MultiStepPlanner(model=model, tool_registry=tool_registry)
 _routed_agents = {}
 storage = ConversationStorage()
 
@@ -326,6 +339,14 @@ def _router_trace(route_context: dict) -> dict:
         "router_decision": decision.model_dump() if isinstance(decision, RouterDecision) else None,
         "route_target": route_target,
         "router_error": route_context.get("router_error"),
+        "plan": route_context.get("plan"),
+        "current_task": route_context.get("current_task"),
+        "task_results": route_context.get("task_results"),
+        "completed_tasks": route_context.get("completed_tasks"),
+        "failed_tasks": route_context.get("failed_tasks"),
+        "execution_trace": route_context.get("execution_trace"),
+        "planner_error": route_context.get("planner_error"),
+        "planner_cancelled": route_context.get("planner_cancelled"),
     }
 
 
@@ -338,16 +359,72 @@ def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
                 "router_decision": trace["router_decision"],
                 "route_target": trace["route_target"],
                 "router_error": trace["router_error"],
+                "plan": trace["plan"],
+                "current_task": trace["current_task"],
+                "task_results": trace["task_results"],
+                "completed_tasks": trace["completed_tasks"],
+                "failed_tasks": trace["failed_tasks"],
+                "execution_trace": trace["execution_trace"],
+                "planner_error": trace["planner_error"],
+                "planner_cancelled": trace["planner_cancelled"],
             }
         )
         return merged
     return trace
 
 
+def _attach_planner_result(route_context: dict, planner_result) -> None:
+    state = planner_result.state.model_dump(mode="json")
+    route_context.update(
+        {
+            "plan": state.get("plan"),
+            "current_task": state.get("current_task"),
+            "task_results": state.get("task_results"),
+            "completed_tasks": state.get("completed_tasks"),
+            "failed_tasks": state.get("failed_tasks"),
+            "execution_trace": state.get("execution_trace"),
+            "planner_cancelled": planner_result.cancelled,
+            "planner_error": planner_result.error,
+        }
+    )
+
+
+def _decision_payload(route_context: dict) -> dict[str, Any] | None:
+    decision = route_context.get("decision")
+    return decision.model_dump() if isinstance(decision, RouterDecision) else None
+
+
+def _planner_step(event: dict[str, Any]) -> dict[str, str]:
+    task = event.get("task") or {}
+    task_label = task.get("description") or event.get("label", "")
+    detail = event.get("error") or ""
+    if event.get("type") == "parallel_execution_started":
+        task_label = "并行执行任务"
+        detail = ", ".join(event.get("task_ids") or [])
+    return {
+        "icon": PLANNER_EVENT_ICONS.get(event.get("type"), "•"),
+        "label": task_label,
+        "detail": detail,
+    }
+
+
 def _invoke_routed(route_context: dict, messages: list) -> str:
     route_target = route_context["route_target"]
     if route_context.get("fallback"):
         return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
+    if route_target == "planner":
+        try:
+            planner_result = planner.run_sync(
+                messages[-1].content,
+                router_decision=_decision_payload(route_context),
+            )
+            _attach_planner_result(route_context, planner_result)
+            return planner_result.response
+        except PlannerError as exc:
+            route_context["planner_error"] = str(exc)
+            route_context["route_target"] = "fallback"
+            route_context["fallback"] = True
+            return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": 8}))
     if route_target == "llm":
         return _response_to_text(
             model.invoke([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages)
@@ -411,6 +488,7 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
     messages.append(HumanMessage(content=user_text))
     full_response = ""
+    cancel_event = asyncio.Event()
 
     async def _agent_worker():
         nonlocal full_response
@@ -443,6 +521,54 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
                         await output_queue.put({"type": "content", "content": content})
                 return
 
+            if route_target == "planner":
+                async def _planner_event_handler(event):
+                    await output_queue.put({"type": event["type"], **event})
+                    await output_queue.put({"type": "rag_step", "step": _planner_step(event)})
+
+                try:
+                    planner_result = await planner.run(
+                        messages[-1].content,
+                        router_decision=_decision_payload(route_context),
+                        event_handler=_planner_event_handler,
+                        cancel_event=cancel_event,
+                    )
+                    _attach_planner_result(route_context, planner_result)
+                    full_response += planner_result.response
+                    await output_queue.put(
+                        {"type": "content", "content": planner_result.response}
+                    )
+                    return
+                except PlannerError as exc:
+                    route_context["planner_error"] = str(exc)
+                    route_context["route_target"] = "fallback"
+                    route_context["fallback"] = True
+                    await output_queue.put(
+                        {
+                            "type": "rag_step",
+                            "step": {
+                                "icon": "⚠️",
+                                "label": "Planner 失败，回退现有 Agent",
+                                "detail": str(exc),
+                            },
+                        }
+                    )
+                    selected_agent = agent
+                    async for msg, metadata in selected_agent.astream(
+                        {"messages": messages},
+                        stream_mode="messages",
+                        config={"recursion_limit": 8},
+                    ):
+                        if not isinstance(msg, AIMessageChunk):
+                            continue
+                        if getattr(msg, "tool_call_chunks", None):
+                            continue
+                        content = _extract_chunk_content(msg)
+                        if content:
+                            full_response += content
+                            await output_queue.put({"type": "content", "content": content})
+                    return
+
             selected_agent = _get_routed_agent(route_target)
             if selected_agent is None:
                 selected_agent = agent
@@ -473,6 +599,7 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
                 break
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     except GeneratorExit:
+        cancel_event.set()
         agent_task.cancel()
         try:
             await agent_task

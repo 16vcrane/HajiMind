@@ -182,6 +182,76 @@ class ToolAsyncInfrastructureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1], "data: [DONE]\n\n")
         self.assertTrue(save.called)
 
+    async def test_streaming_planner_events_are_forwarded(self):
+        class FakePlannerResult:
+            cancelled = False
+            error = None
+
+            class State:
+                def model_dump(self, mode="json"):
+                    return {
+                        "plan": {"tasks": []},
+                        "current_task": None,
+                        "task_results": {},
+                        "completed_tasks": ["task_1"],
+                        "failed_tasks": [],
+                        "execution_trace": [],
+                    }
+
+            state = State()
+            response = "planned answer"
+
+        class FakePlanner:
+            async def run(self, *_args, event_handler=None, **_kwargs):
+                for event_type in (
+                    "planner_started",
+                    "task_created",
+                    "task_started",
+                    "task_completed",
+                    "synthesis_started",
+                ):
+                    await event_handler(
+                        {
+                            "type": event_type,
+                            "label": event_type,
+                            "task": {
+                                "id": "task_1",
+                                "description": "测试任务",
+                                "tool": "synthesis",
+                            },
+                        }
+                    )
+                return FakePlannerResult()
+
+        with (
+            patch.object(agent, "planner", FakePlanner()),
+            patch.object(
+                agent,
+                "_select_route",
+                return_value={
+                    "decision": None,
+                    "route_target": "planner",
+                    "router_error": None,
+                    "fallback": False,
+                },
+            ),
+            patch.object(agent.storage, "load", return_value=[]),
+            patch.object(agent.storage, "save"),
+        ):
+            events = [
+                event
+                async for event in agent.chat_with_agent_stream(
+                    "test planner",
+                    user_id=1,
+                    session_id="planner-stream-test",
+                )
+            ]
+
+        joined = "".join(events)
+        self.assertIn('"type": "planner_started"', joined)
+        self.assertIn('"type": "task_completed"', joined)
+        self.assertIn("planned answer", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,14 @@ class RagTrace(BaseModel):
     router_decision: Optional[dict[str, Any]] = None
     route_target: Optional[str] = None
     router_error: Optional[str] = None
+    plan: Optional[dict[str, Any]] = None
+    current_task: Optional[str] = None
+    task_results: Optional[dict[str, Any]] = None
+    completed_tasks: Optional[List[str]] = None
+    failed_tasks: Optional[List[str]] = None
+    execution_trace: Optional[List[dict[str, Any]]] = None
+    planner_error: Optional[str] = None
+    planner_cancelled: Optional[bool] = None
     query: Optional[str] = None
     expanded_query: Optional[str] = None
     step_back_question: Optional[str] = None
