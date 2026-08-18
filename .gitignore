@@ -17,4 +17,9 @@ volumes/
 .DS_Store
 data/
 
+*.doc
 *.docx
+.claude
+docs/
+
+

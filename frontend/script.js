@@ -95,6 +95,52 @@ createApp({
         parseMarkdown(text) {
             return marked.parse(text);
         },
+
+        isPlannerEvent(type) {
+            return [
+                'agent_step',
+                'router_step',
+                'planner_step',
+                'planner_started',
+                'task_created',
+                'task_started',
+                'task_completed',
+                'task_failed',
+                'parallel_execution_started',
+                'synthesis_started',
+                'tool_start',
+                'tool_result',
+                'task_start',
+                'task_result'
+            ].includes(type);
+        },
+
+        getTrace(msg) {
+            if (!msg || msg.isUser) return null;
+            return msg.agentTrace || (msg.ragTrace && msg.ragTrace.agent_trace) || msg.ragTrace || null;
+        },
+
+        workflowTasks(trace) {
+            if (!trace) return [];
+            return trace.task_traces || trace.execution_trace || [];
+        },
+
+        workflowTools(trace) {
+            if (!trace) return [];
+            return trace.tool_calls || [];
+        },
+
+        workflowRagTrace(trace) {
+            if (!trace) return null;
+            return trace.rag_trace || trace;
+        },
+
+        workflowResultCount(tool) {
+            if (tool.result_count !== null && tool.result_count !== undefined) {
+                return tool.result_count;
+            }
+            return '-';
+        },
         
         escapeHtml(text) {
             const div = document.createElement('div');
@@ -149,7 +195,9 @@ createApp({
                 isUser: false, 
                 isThinking: true, 
                 ragTrace: null,
-                ragSteps: [] 
+                agentTrace: null,
+                ragSteps: [],
+                plannerEvents: []
             });
             const botMsgIdx = this.messages.length - 1;
 
@@ -194,12 +242,18 @@ createApp({
                                     this.messages[botMsgIdx].text += data.content;
                                 } else if (data.type === 'trace') {
                                     this.messages[botMsgIdx].ragTrace = data.rag_trace;
+                                    this.messages[botMsgIdx].agentTrace = data.agent_trace || (data.rag_trace && data.rag_trace.agent_trace) || null;
                                 } else if (data.type === 'rag_step') {
                                     // 实时 RAG 检索步骤 — 直接显示在思考气泡内
                                     if (!this.messages[botMsgIdx].ragSteps) {
                                         this.messages[botMsgIdx].ragSteps = [];
                                     }
                                     this.messages[botMsgIdx].ragSteps.push(data.step);
+                                } else if (this.isPlannerEvent(data.type)) {
+                                    if (!this.messages[botMsgIdx].plannerEvents) {
+                                        this.messages[botMsgIdx].plannerEvents = [];
+                                    }
+                                    this.messages[botMsgIdx].plannerEvents.push(data);
                                 } else if (data.type === 'error') {
                                     this.messages[botMsgIdx].isThinking = false;
                                     this.messages[botMsgIdx].text += `\n[Error: ${data.content}]`;
@@ -297,7 +351,8 @@ createApp({
                 this.messages = data.messages.map(msg => ({
                     text: msg.content,
                     isUser: msg.type === 'human',
-                    ragTrace: msg.rag_trace || null
+                    ragTrace: msg.rag_trace || null,
+                    agentTrace: msg.rag_trace && msg.rag_trace.agent_trace ? msg.rag_trace.agent_trace : null
                 }));
                 
                 this.$nextTick(() => {

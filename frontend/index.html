@@ -240,10 +240,91 @@
                     </div>
                     <!-- 正常回复内容 -->
                     <div v-else class="message-content" v-html="msg.isUser ? escapeHtml(msg.text) : parseMarkdown(msg.text)"></div>
+                    <div v-if="!msg.isUser && getTrace(msg)" class="agent-workflow-panel">
+                        <div class="workflow-title">Agent Workflow</div>
+                        <div class="workflow-row">
+                            <div class="workflow-node workflow-question">
+                                <span class="workflow-node-title">User Question</span>
+                            </div>
+                        </div>
+                        <div class="workflow-arrow">↓</div>
+                        <div class="workflow-row">
+                            <div class="workflow-node">
+                                <span class="workflow-node-title">Router</span>
+                                <span class="workflow-node-meta">
+                                    {{ getTrace(msg).intent || (getTrace(msg).router_decision && getTrace(msg).router_decision.intent) || 'unknown' }}
+                                </span>
+                            </div>
+                        </div>
+                        <div class="workflow-arrow">↓</div>
+                        <div class="workflow-row">
+                            <div class="workflow-node">
+                                <span class="workflow-node-title">Planner</span>
+                                <span class="workflow-node-meta">{{ getTrace(msg).route || getTrace(msg).route_target || 'llm' }}</span>
+                            </div>
+                        </div>
+                        <div v-if="workflowTools(getTrace(msg)).length" class="workflow-arrow">↓</div>
+                        <div v-if="workflowTools(getTrace(msg)).length" class="workflow-tools-grid">
+                            <div v-for="(tool, tIdx) in workflowTools(getTrace(msg))" :key="'tool-'+tIdx" class="workflow-tool-card">
+                                <div class="workflow-tool-name">{{ tool.tool_name }}</div>
+                                <div class="workflow-tool-status" :class="'status-' + tool.status">{{ tool.status }}</div>
+                                <div class="workflow-tool-meta">{{ tool.latency_ms || '-' }} ms</div>
+                                <div class="workflow-tool-meta">Result count: {{ workflowResultCount(tool) }}</div>
+                            </div>
+                            <div v-if="workflowRagTrace(getTrace(msg)) && workflowRagTrace(getTrace(msg)).tool_name === 'search_knowledge_base'" class="workflow-tool-card workflow-rag-card">
+                                <div class="workflow-tool-name">RAG</div>
+                                <div class="workflow-rag-modes">
+                                    <span>Dense</span>
+                                    <span>BM25</span>
+                                    <span>RRF</span>
+                                    <span>Rerank: {{ workflowRagTrace(getTrace(msg)).rerank_applied ? 'on' : 'off' }}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div v-if="workflowTasks(getTrace(msg)).length" class="workflow-arrow">↓</div>
+                        <div v-if="workflowTasks(getTrace(msg)).length" class="workflow-task-list">
+                            <div v-for="(task, taskIdx) in workflowTasks(getTrace(msg))" :key="'task-'+taskIdx" class="workflow-task-line">
+                                <span class="workflow-task-status">{{ task.status === 'completed' ? '✓' : (task.status === 'failed' ? '×' : '●') }}</span>
+                                <span>{{ task.description || task.task_id }}</span>
+                                <span class="workflow-tool-meta">{{ task.latency_ms || '-' }} ms</span>
+                            </div>
+                        </div>
+                        <div class="workflow-arrow">↓</div>
+                        <div class="workflow-row">
+                            <div class="workflow-node workflow-final">
+                                <span class="workflow-node-title">Final Answer</span>
+                                <span class="workflow-node-meta">{{ getTrace(msg).final_status || 'success' }}</span>
+                            </div>
+                        </div>
+                    </div>
                     <div v-if="!msg.isUser && msg.ragTrace" class="message-meta">
                         <details class="reasoning-details">
                             <summary>检索过程</summary>
                             <div class="reasoning-content">
+                                <div v-if="msg.ragTrace.router_decision" class="trace-line">
+                                    Router：{{ msg.ragTrace.router_decision.intent }} / {{ msg.ragTrace.router_decision.complexity }}
+                                </div>
+                                <div v-if="msg.ragTrace.route_target" class="trace-line">
+                                    路由目标：{{ msg.ragTrace.route_target }}
+                                </div>
+                                <div v-if="msg.ragTrace.router_decision && msg.ragTrace.router_decision.reason" class="trace-line">
+                                    路由原因：{{ msg.ragTrace.router_decision.reason }}
+                                </div>
+                                <div v-if="msg.ragTrace.router_error" class="trace-line">
+                                    Router回退：{{ msg.ragTrace.router_error }}
+                                </div>
+                                <div v-if="msg.ragTrace.plan && msg.ragTrace.plan.tasks" class="trace-line">
+                                    Plan任务数：{{ msg.ragTrace.plan.tasks.length }}
+                                </div>
+                                <div v-if="msg.ragTrace.completed_tasks && msg.ragTrace.completed_tasks.length" class="trace-line">
+                                    已完成任务：{{ msg.ragTrace.completed_tasks.join(', ') }}
+                                </div>
+                                <div v-if="msg.ragTrace.failed_tasks && msg.ragTrace.failed_tasks.length" class="trace-line">
+                                    失败任务：{{ msg.ragTrace.failed_tasks.join(', ') }}
+                                </div>
+                                <div v-if="msg.ragTrace.planner_error" class="trace-line">
+                                    Planner状态：{{ msg.ragTrace.planner_error }}
+                                </div>
                                 <div class="trace-line">
                                     工具：{{ msg.ragTrace.tool_used ? msg.ragTrace.tool_name : '未使用' }}
                                 </div>

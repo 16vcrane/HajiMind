@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import HTTPException
@@ -11,15 +13,20 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from sqlalchemy import select, desc
 
 from auth import get_current_user
+from agent_planner import MultiStepPlanner, PlannerError
+from agent_observability import AgentTrace, monotonic_ms, new_request_id, utc_now_iso
+from agent_reliability import get_reliability_config
+from agent_router import AgentRouter, RouterDecision, resolve_route_target, route_label
 from cache import cache_delete, cache_get_json, cache_set_json
 from database import db_session
+from memory import MemoryService, memory_prompt
 from models import ChatMessage, ChatSession, User
 from tools import (
-    get_current_weather,
+    get_agent_tools,
     get_last_rag_context,
     reset_tool_call_guards,
     set_rag_step_queue,
-    search_knowledge_base,
+    tool_registry,
 )
 
 load_dotenv()
@@ -27,6 +34,73 @@ load_dotenv()
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
+
+CORE_SYSTEM_PROMPT = (
+    "You are a cute cat bot that loves to help users. "
+    "When responding, you may use tools to assist. "
+    "If you don't know the answer, admit it honestly."
+)
+
+AGENT_SYSTEM_PROMPT = (
+    CORE_SYSTEM_PROMPT
+    + (
+    "Use search_knowledge_base when users ask document/knowledge questions. "
+    "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
+    "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
+    "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
+    "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
+    "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
+    "but do not reveal chain-of-thought. "
+    )
+)
+
+ROUTED_AGENT_PROMPTS = {
+    "rag": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected RAG. Use search_knowledge_base once, then answer from the retrieved context."
+    ),
+    "baidu": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected web search. Use baidu_search when current external web information is needed."
+    ),
+    "life_service": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected life service. Use life_service for weather or forecast requests."
+    ),
+    "calendar": (
+        AGENT_SYSTEM_PROMPT
+        + " The router selected calendar/time. Use calendar_time for date, weekday, timezone, and date arithmetic."
+    ),
+    "planner": (
+        CORE_SYSTEM_PROMPT
+        + " The router selected Planner. Decompose the task briefly, use only necessary tools, "
+        "call each tool at most once unless the user explicitly asks otherwise, "
+        "and synthesize a final answer. For mixed tasks, combine all required evidence before planning."
+    ),
+}
+
+ROUTED_TOOL_NAMES = {
+    "rag": ("search_knowledge_base",),
+    "baidu": ("baidu_search",),
+    "life_service": ("life_service",),
+    "calendar": ("calendar_time",),
+    "planner": (
+        "search_knowledge_base",
+        "baidu_search",
+        "life_service",
+        "calendar_time",
+    ),
+}
+
+PLANNER_EVENT_ICONS = {
+    "planner_started": "🧩",
+    "task_created": "○",
+    "task_started": "●",
+    "task_completed": "✓",
+    "task_failed": "×",
+    "parallel_execution_started": "↔",
+    "synthesis_started": "◆",
+}
 
 
 class ConversationStorage:
@@ -175,25 +249,18 @@ def create_agent_instance():
 
     agent = create_agent(
         model=model,
-        tools=[get_current_weather, search_knowledge_base],
-        system_prompt=(
-            "You are a cute cat bot that loves to help users. "
-            "When responding, you may use tools to assist. "
-            "Use search_knowledge_base when users ask document/knowledge questions. "
-            "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
-            "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
-            "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
-            "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
-            "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
-            "but do not reveal chain-of-thought. "
-            "If you don't know the answer, admit it honestly."
-        ),
+        tools=get_agent_tools(),
+        system_prompt=AGENT_SYSTEM_PROMPT,
     )
     return agent, model
 
 
 agent, model = create_agent_instance()
+router = AgentRouter(model)
+planner = MultiStepPlanner(model=model, tool_registry=tool_registry)
+_routed_agents = {}
 storage = ConversationStorage()
+memory_service = MemoryService()
 
 
 def summarize_old_messages(model, messages: list) -> str:
@@ -224,8 +291,271 @@ def _response_to_text(result) -> str:
     return str(result)
 
 
+def _extract_chunk_content(msg) -> str:
+    content = ""
+    if isinstance(msg.content, str):
+        content = msg.content
+    elif isinstance(msg.content, list):
+        for block in msg.content:
+            if isinstance(block, str):
+                content += block
+            elif isinstance(block, dict) and block.get("type") == "text":
+                content += block.get("text", "")
+    return content
+
+
+def _get_routed_agent(route_target: str):
+    if route_target not in ROUTED_TOOL_NAMES:
+        return None
+    if route_target not in _routed_agents:
+        _routed_agents[route_target] = create_agent(
+            model=model,
+            tools=tool_registry.as_langchain_tools(ROUTED_TOOL_NAMES[route_target]),
+            system_prompt=ROUTED_AGENT_PROMPTS[route_target],
+        )
+    return _routed_agents[route_target]
+
+
+def _select_route(user_text: str, messages: list) -> dict:
+    started_at = time.perf_counter()
+    try:
+        decision = router.decide(user_text, history=messages)
+        route_target = resolve_route_target(decision)
+        return {
+            "decision": decision,
+            "route_target": route_target,
+            "router_error": None,
+            "fallback": False,
+            "router_latency_ms": monotonic_ms(started_at),
+        }
+    except Exception as exc:
+        return {
+            "decision": None,
+            "route_target": "fallback",
+            "router_error": str(exc),
+            "fallback": True,
+            "router_latency_ms": monotonic_ms(started_at),
+        }
+
+
+def _router_trace(route_context: dict) -> dict:
+    decision = route_context.get("decision")
+    route_target = route_context.get("route_target", "fallback")
+    return {
+        "tool_used": route_target not in ("llm", "fallback"),
+        "tool_name": route_label(route_target),
+        "router_decision": decision.model_dump() if isinstance(decision, RouterDecision) else None,
+        "route_target": route_target,
+        "router_error": route_context.get("router_error"),
+        "plan": route_context.get("plan"),
+        "current_task": route_context.get("current_task"),
+        "task_results": route_context.get("task_results"),
+        "completed_tasks": route_context.get("completed_tasks"),
+        "failed_tasks": route_context.get("failed_tasks"),
+        "execution_trace": route_context.get("execution_trace"),
+        "planner_error": route_context.get("planner_error"),
+        "planner_cancelled": route_context.get("planner_cancelled"),
+        "tool_calls": route_context.get("tool_calls"),
+        "task_traces": route_context.get("task_traces"),
+        "recovery_attempts": route_context.get("recovery_attempts"),
+        "recovery_events": route_context.get("recovery_events"),
+        "memory_trace": route_context.get("memory_trace"),
+    }
+
+
+def _merge_agent_trace(route_context: dict, rag_trace: dict | None) -> dict:
+    trace = _router_trace(route_context)
+    if rag_trace:
+        merged = dict(rag_trace)
+        merged.update(
+            {
+                "router_decision": trace["router_decision"],
+                "route_target": trace["route_target"],
+                "router_error": trace["router_error"],
+                "plan": trace["plan"],
+                "current_task": trace["current_task"],
+                "task_results": trace["task_results"],
+                "completed_tasks": trace["completed_tasks"],
+                "failed_tasks": trace["failed_tasks"],
+                "execution_trace": trace["execution_trace"],
+                "planner_error": trace["planner_error"],
+                "planner_cancelled": trace["planner_cancelled"],
+                "tool_calls": trace["tool_calls"],
+                "task_traces": trace["task_traces"],
+                "recovery_attempts": trace["recovery_attempts"],
+                "recovery_events": trace["recovery_events"],
+                "memory_trace": trace["memory_trace"],
+            }
+        )
+        return merged
+    return trace
+
+
+def _attach_planner_result(route_context: dict, planner_result) -> None:
+    state = planner_result.state.model_dump(mode="json")
+    route_context.update(
+        {
+            "plan": state.get("plan"),
+            "current_task": state.get("current_task"),
+            "task_results": state.get("task_results"),
+            "completed_tasks": state.get("completed_tasks"),
+            "failed_tasks": state.get("failed_tasks"),
+            "execution_trace": state.get("execution_trace"),
+            "tool_calls": state.get("tool_calls"),
+            "task_traces": state.get("task_traces"),
+            "planner_cancelled": planner_result.cancelled,
+            "planner_error": planner_result.error,
+            "recovery_attempts": state.get("recovery_attempts"),
+            "recovery_events": state.get("recovery_events"),
+        }
+    )
+
+
+def _build_agent_trace(
+    *,
+    route_context: dict,
+    legacy_trace: dict,
+    request_id: str,
+    session_id: str,
+    user_id: int,
+    started_at: float,
+    final_status: str,
+) -> dict:
+    decision = route_context.get("decision")
+    errors = [
+        error
+        for error in (
+            route_context.get("router_error"),
+            route_context.get("planner_error"),
+        )
+        if error
+    ]
+    if final_status == "success" and route_context.get("failed_tasks"):
+        final_status = "partial_success"
+    rag_payload = legacy_trace.get("rag_trace")
+    if rag_payload is None and legacy_trace.get("tool_name") == "search_knowledge_base":
+        rag_payload = dict(legacy_trace)
+    agent_trace = AgentTrace(
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        intent=decision.intent if isinstance(decision, RouterDecision) else None,
+        complexity=decision.complexity if isinstance(decision, RouterDecision) else None,
+        route=route_context.get("route_target"),
+        plan=route_context.get("plan"),
+        tool_calls=route_context.get("tool_calls") or [],
+        rag_trace=rag_payload if isinstance(rag_payload, dict) else None,
+        memory=route_context.get("memory_trace") or {},
+        task_results=route_context.get("task_results") or {},
+        task_traces=route_context.get("task_traces") or [],
+        recovery_attempts=route_context.get("recovery_attempts") or 0,
+        recovery_events=route_context.get("recovery_events") or [],
+        latency={
+            "total_ms": monotonic_ms(started_at),
+            "router_ms": route_context.get("router_latency_ms"),
+        },
+        errors=errors,
+        final_status=final_status,
+    ).model_dump(mode="json")
+    merged = dict(legacy_trace)
+    merged.update(agent_trace)
+    merged["memory_trace"] = route_context.get("memory_trace") or {}
+    merged["agent_trace"] = agent_trace
+    return merged
+
+
+def _prepare_memory_context(
+    user_id: int,
+    user_text: str,
+    conversation_message_count: int,
+) -> tuple[SystemMessage | None, dict]:
+    memory_trace = {
+        "working_memory_used": True,
+        "conversation_message_count": conversation_message_count,
+        "retrieved_memory_ids": [],
+        "extracted_memory_ids": [],
+        "skipped_reasons": [],
+    }
+    try:
+        records = memory_service.retrieve(user_id, query=user_text)
+    except Exception:
+        memory_trace["skipped_reasons"].append("memory_retrieval_unavailable")
+        return None, memory_trace
+
+    memory_trace["retrieved_memory_ids"] = [record["id"] for record in records]
+    prompt = memory_prompt(records)
+    return (SystemMessage(content=prompt) if prompt else None), memory_trace
+
+
+def _extract_long_term_memory(
+    memory_trace: dict,
+    *,
+    user_id: int,
+    user_text: str,
+    session_id: str,
+) -> None:
+    try:
+        result = memory_service.extract_and_store(user_id, user_text, session_id)
+        memory_trace["extracted_memory_ids"] = result.memory_ids
+        memory_trace["skipped_reasons"].extend(result.skipped_reasons)
+    except Exception:
+        memory_trace["skipped_reasons"].append("memory_extraction_unavailable")
+
+
+def _decision_payload(route_context: dict) -> dict[str, Any] | None:
+    decision = route_context.get("decision")
+    return decision.model_dump() if isinstance(decision, RouterDecision) else None
+
+
+def _planner_step(event: dict[str, Any]) -> dict[str, str]:
+    task = event.get("task") or {}
+    task_label = task.get("description") or event.get("label", "")
+    detail = event.get("error") or ""
+    if event.get("type") == "parallel_execution_started":
+        task_label = "并行执行任务"
+        detail = ", ".join(event.get("task_ids") or [])
+    return {
+        "icon": PLANNER_EVENT_ICONS.get(event.get("type"), "•"),
+        "label": task_label,
+        "detail": detail,
+    }
+
+
+def _invoke_routed(route_context: dict, messages: list) -> str:
+    max_agent_steps = get_reliability_config().max_agent_steps
+    route_target = route_context["route_target"]
+    if route_context.get("fallback"):
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
+    if route_target == "planner":
+        try:
+            planner_result = planner.run_sync(
+                messages[-1].content,
+                router_decision=_decision_payload(route_context),
+            )
+            _attach_planner_result(route_context, planner_result)
+            return planner_result.response
+        except PlannerError as exc:
+            route_context["planner_error"] = str(exc)
+            route_context["route_target"] = "fallback"
+            route_context["fallback"] = True
+            return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
+    if route_target == "llm":
+        return _response_to_text(
+            model.invoke([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages)
+        )
+    selected_agent = _get_routed_agent(route_target)
+    if selected_agent is None:
+        return _response_to_text(agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps}))
+    return _response_to_text(
+        selected_agent.invoke({"messages": messages}, config={"recursion_limit": max_agent_steps})
+    )
+
+
 def chat_with_agent(user_text: str, user_id: int, session_id: str):
-    messages = storage.load(user_id, session_id)
+    request_started_at = time.perf_counter()
+    request_id = new_request_id()
+    persisted_messages = storage.load(user_id, session_id)
+    messages = list(persisted_messages)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
 
@@ -233,21 +563,49 @@ def chat_with_agent(user_text: str, user_id: int, session_id: str):
         summary = summarize_old_messages(model, messages[:40])
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
+    route_context = _select_route(user_text, messages)
+    memory_message, memory_trace = _prepare_memory_context(
+        user_id,
+        user_text,
+        len(persisted_messages),
+    )
+    route_context["memory_trace"] = memory_trace
+    if memory_message:
+        messages.insert(0, memory_message)
     messages.append(HumanMessage(content=user_text))
-    result = agent.invoke({"messages": messages}, config={"recursion_limit": 8})
-    response_content = _response_to_text(result)
+    response_content = _invoke_routed(route_context, messages)
     messages.append(AIMessage(content=response_content))
+    _extract_long_term_memory(
+        memory_trace,
+        user_id=user_id,
+        user_text=user_text,
+        session_id=session_id,
+    )
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
-    storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
+    legacy_trace = _merge_agent_trace(route_context, rag_trace)
+    agent_trace = _build_agent_trace(
+        route_context=route_context,
+        legacy_trace=legacy_trace,
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        started_at=request_started_at,
+        final_status="success",
+    )
+    persisted_messages.extend([HumanMessage(content=user_text), AIMessage(content=response_content)])
+    extra_message_data = [None] * (len(persisted_messages) - 1) + [{"rag_trace": agent_trace}]
+    storage.save(user_id, session_id, persisted_messages, extra_message_data=extra_message_data)
 
-    return {"response": response_content, "rag_trace": rag_trace}
+    return {"response": response_content, "rag_trace": agent_trace}
 
 
 async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
-    messages = storage.load(user_id, session_id)
+    request_started_at = time.perf_counter()
+    request_id = new_request_id()
+    persisted_messages = storage.load(user_id, session_id)
+    messages = list(persisted_messages)
     get_last_rag_context(clear=True)
     reset_tool_call_guards()
 
@@ -263,30 +621,134 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
         summary = summarize_old_messages(model, messages[:40])
         messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
 
+    yield f"data: {json.dumps({'type': 'agent_step', 'request_id': request_id, 'label': 'request_started', 'timestamp': utc_now_iso()}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'label': '正在分析问题'}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': '正在分析问题', 'detail': ''}}, ensure_ascii=False)}\n\n"
+    route_context = await asyncio.to_thread(_select_route, user_text, messages)
+    memory_message, memory_trace = await asyncio.to_thread(
+        _prepare_memory_context,
+        user_id,
+        user_text,
+        len(persisted_messages),
+    )
+    route_context["memory_trace"] = memory_trace
+    if memory_message:
+        messages.insert(0, memory_message)
+    decision = route_context.get("decision")
+    if isinstance(decision, RouterDecision):
+        yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'intent': decision.intent, 'complexity': decision.complexity, 'route': route_context['route_target'], 'reason': decision.reason}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '🧭', 'label': decision.intent, 'detail': decision.reason}}, ensure_ascii=False)}\n\n"
+    elif route_context.get("router_error"):
+        yield f"data: {json.dumps({'type': 'router_step', 'request_id': request_id, 'route': 'fallback', 'error': route_context['router_error']}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '⚠️', 'label': 'Router 失败，回退现有 Agent', 'detail': route_context['router_error']}}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'rag_step', 'step': {'icon': '➡️', 'label': route_label(route_context['route_target']), 'detail': ''}}, ensure_ascii=False)}\n\n"
+
     messages.append(HumanMessage(content=user_text))
     full_response = ""
+    cancel_event = asyncio.Event()
 
     async def _agent_worker():
         nonlocal full_response
         try:
-            async for msg, metadata in agent.astream(
+            max_agent_steps = get_reliability_config().max_agent_steps
+            route_target = route_context["route_target"]
+            if route_context.get("fallback"):
+                selected_agent = agent
+                async for msg, metadata in selected_agent.astream(
+                    {"messages": messages},
+                    stream_mode="messages",
+                    config={"recursion_limit": max_agent_steps},
+                ):
+                    if not isinstance(msg, AIMessageChunk):
+                        continue
+                    if getattr(msg, "tool_call_chunks", None):
+                        continue
+                    content = _extract_chunk_content(msg)
+                    if content:
+                        full_response += content
+                        await output_queue.put({"type": "content", "content": content})
+                return
+
+            if route_target == "llm":
+                async for msg in model.astream([SystemMessage(content=AGENT_SYSTEM_PROMPT)] + messages):
+                    if not isinstance(msg, AIMessageChunk):
+                        continue
+                    content = _extract_chunk_content(msg)
+                    if content:
+                        full_response += content
+                        await output_queue.put({"type": "content", "content": content})
+                return
+
+            if route_target == "planner":
+                async def _planner_event_handler(event):
+                    await output_queue.put({**event, "type": "planner_step"})
+                    await output_queue.put({"type": event["type"], **event})
+                    if event["type"] == "task_started":
+                        await output_queue.put({**event, "type": "task_start"})
+                    elif event["type"] in ("task_completed", "task_failed"):
+                        await output_queue.put({**event, "type": "task_result"})
+                    elif event["type"] == "tool_start":
+                        await output_queue.put({**event, "type": "tool_start"})
+                    elif event["type"] == "tool_result":
+                        await output_queue.put({**event, "type": "tool_result"})
+                    await output_queue.put({"type": "rag_step", "step": _planner_step(event)})
+
+                try:
+                    planner_result = await planner.run(
+                        messages[-1].content,
+                        router_decision=_decision_payload(route_context),
+                        event_handler=_planner_event_handler,
+                        cancel_event=cancel_event,
+                    )
+                    _attach_planner_result(route_context, planner_result)
+                    full_response += planner_result.response
+                    await output_queue.put(
+                        {"type": "content", "content": planner_result.response}
+                    )
+                    return
+                except PlannerError as exc:
+                    route_context["planner_error"] = str(exc)
+                    route_context["route_target"] = "fallback"
+                    route_context["fallback"] = True
+                    await output_queue.put(
+                        {
+                            "type": "rag_step",
+                            "step": {
+                                "icon": "⚠️",
+                                "label": "Planner 失败，回退现有 Agent",
+                                "detail": str(exc),
+                            },
+                        }
+                    )
+                    selected_agent = agent
+                    async for msg, metadata in selected_agent.astream(
+                        {"messages": messages},
+                        stream_mode="messages",
+                        config={"recursion_limit": max_agent_steps},
+                    ):
+                        if not isinstance(msg, AIMessageChunk):
+                            continue
+                        if getattr(msg, "tool_call_chunks", None):
+                            continue
+                        content = _extract_chunk_content(msg)
+                        if content:
+                            full_response += content
+                            await output_queue.put({"type": "content", "content": content})
+                    return
+
+            selected_agent = _get_routed_agent(route_target)
+            if selected_agent is None:
+                selected_agent = agent
+            async for msg, metadata in selected_agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
-                config={"recursion_limit": 8},
+                config={"recursion_limit": max_agent_steps},
             ):
                 if not isinstance(msg, AIMessageChunk):
                     continue
                 if getattr(msg, "tool_call_chunks", None):
                     continue
-                content = ""
-                if isinstance(msg.content, str):
-                    content = msg.content
-                elif isinstance(msg.content, list):
-                    for block in msg.content:
-                        if isinstance(block, str):
-                            content += block
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            content += block.get("text", "")
+                content = _extract_chunk_content(msg)
                 if content:
                     full_response += content
                     await output_queue.put({"type": "content", "content": content})
@@ -304,6 +766,7 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
                 break
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     except GeneratorExit:
+        cancel_event.set()
         agent_task.cancel()
         try:
             await agent_task
@@ -317,10 +780,29 @@ async def chat_with_agent_stream(user_text: str, user_id: int, session_id: str):
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
-    if rag_trace:
-        yield f"data: {json.dumps({'type': 'trace', 'rag_trace': rag_trace}, ensure_ascii=False)}\n\n"
+    _extract_long_term_memory(
+        memory_trace,
+        user_id=user_id,
+        user_text=user_text,
+        session_id=session_id,
+    )
+    legacy_trace = _merge_agent_trace(route_context, rag_trace)
+    final_status = "cancelled" if route_context.get("planner_cancelled") else "success"
+    if route_context.get("router_error") or route_context.get("planner_error"):
+        final_status = "error" if route_context.get("planner_error") else final_status
+    agent_trace = _build_agent_trace(
+        route_context=route_context,
+        legacy_trace=legacy_trace,
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+        started_at=request_started_at,
+        final_status=final_status,
+    )
+    if agent_trace:
+        yield f"data: {json.dumps({'type': 'trace', 'agent_trace': agent_trace.get('agent_trace'), 'rag_trace': agent_trace}, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
-    messages.append(AIMessage(content=full_response))
-    extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
-    storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)
+    persisted_messages.extend([HumanMessage(content=user_text), AIMessage(content=full_response)])
+    extra_message_data = [None] * (len(persisted_messages) - 1) + [{"rag_trace": agent_trace}]
+    storage.save(user_id, session_id, persisted_messages, extra_message_data=extra_message_data)

@@ -2,6 +2,10 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+try:
+    from pymilvus import WeightedRanker
+except ImportError:  # pragma: no cover - depends on pymilvus version
+    WeightedRanker = None
 from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker
 
 load_dotenv()
@@ -58,12 +62,18 @@ class MilvusManager:
             schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
             
             # 文本和元数据字段
-            schema.add_field("text", DataType.VARCHAR, max_length=2000)
+            schema.add_field("text", DataType.VARCHAR, max_length=8192)
             schema.add_field("filename", DataType.VARCHAR, max_length=255)
             schema.add_field("file_type", DataType.VARCHAR, max_length=50)
             schema.add_field("file_path", DataType.VARCHAR, max_length=1024)
             schema.add_field("page_number", DataType.INT64)
             schema.add_field("chunk_idx", DataType.INT64)
+            schema.add_field("primary_structure_type", DataType.VARCHAR, max_length=64)
+            schema.add_field("structure_types", DataType.JSON)
+            schema.add_field("image_metadata", DataType.JSON)
+            schema.add_field("semantic_chunking", DataType.BOOL)
+            schema.add_field("parser_fallback", DataType.BOOL)
+            schema.add_field("token_estimate", DataType.INT64)
 
             # Auto-merging 所需层级字段
             schema.add_field("chunk_id", DataType.VARCHAR, max_length=512)
@@ -128,6 +138,12 @@ class MilvusManager:
                 "root_chunk_id",
                 "chunk_level",
                 "chunk_idx",
+                "primary_structure_type",
+                "structure_types",
+                "image_metadata",
+                "semantic_chunking",
+                "parser_fallback",
+                "token_estimate",
             ],
             limit=len(ids),
         )
@@ -139,6 +155,9 @@ class MilvusManager:
         top_k: int = 5,
         rrf_k: int = 60,     #可调节
         filter_expr: str = "",
+        dense_weight: float = 0.5,
+        sparse_weight: float = 0.5,
+        ranker_type: str = "rrf",
     ) -> list[dict]:
         """
         混合检索 - 使用 RRF 融合密集向量和稀疏向量的检索结果
@@ -159,6 +178,12 @@ class MilvusManager:
             "root_chunk_id",
             "chunk_level",
             "chunk_idx",
+            "primary_structure_type",
+            "structure_types",
+            "image_metadata",
+            "semantic_chunking",
+            "parser_fallback",
+            "token_estimate",
         ]
         
         # 密集向量搜索请求
@@ -179,8 +204,11 @@ class MilvusManager:
             expr=filter_expr,
         )
         
-        # 使用 RRF 排序算法融合结果
-        reranker = RRFRanker(k=rrf_k)
+        # 使用 RRF 或 WeightedRanker 融合结果；不支持时回退 RRF。
+        if ranker_type == "weighted" and WeightedRanker is not None:
+            reranker = WeightedRanker(dense_weight, sparse_weight)
+        else:
+            reranker = RRFRanker(k=rrf_k)
         
         results = self.client.hybrid_search(
             collection_name=self.collection_name,
@@ -205,6 +233,12 @@ class MilvusManager:
                     "root_chunk_id": hit.get("root_chunk_id", ""),
                     "chunk_level": hit.get("chunk_level", 0),
                     "chunk_idx": hit.get("chunk_idx", 0),
+                    "primary_structure_type": hit.get("primary_structure_type", ""),
+                    "structure_types": hit.get("structure_types", []),
+                    "image_metadata": hit.get("image_metadata", []),
+                    "semantic_chunking": hit.get("semantic_chunking", False),
+                    "parser_fallback": hit.get("parser_fallback", False),
+                    "token_estimate": hit.get("token_estimate", 0),
                     "score": hit.get("distance", 0.0)
                 })
         
@@ -230,6 +264,12 @@ class MilvusManager:
                 "root_chunk_id",
                 "chunk_level",
                 "chunk_idx",
+                "primary_structure_type",
+                "structure_types",
+                "image_metadata",
+                "semantic_chunking",
+                "parser_fallback",
+                "token_estimate",
             ],
             filter=filter_expr,
         )
@@ -248,9 +288,68 @@ class MilvusManager:
                     "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
                     "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
                     "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
+                    "primary_structure_type": hit.get("entity", {}).get("primary_structure_type", ""),
+                    "structure_types": hit.get("entity", {}).get("structure_types", []),
+                    "image_metadata": hit.get("entity", {}).get("image_metadata", []),
+                    "semantic_chunking": hit.get("entity", {}).get("semantic_chunking", False),
+                    "parser_fallback": hit.get("entity", {}).get("parser_fallback", False),
+                    "token_estimate": hit.get("entity", {}).get("token_estimate", 0),
                     "score": hit.get("distance", 0.0)
                 })
         
+        return formatted_results
+
+    def sparse_retrieve(self, sparse_embedding: dict, top_k: int = 5, filter_expr: str = "") -> list[dict]:
+        """仅使用稀疏向量检索，便于 BM25 评估。"""
+        results = self.client.search(
+            collection_name=self.collection_name,
+            data=[sparse_embedding],
+            anns_field="sparse_embedding",
+            search_params={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+            limit=top_k,
+            output_fields=[
+                "text",
+                "filename",
+                "file_type",
+                "page_number",
+                "chunk_id",
+                "parent_chunk_id",
+                "root_chunk_id",
+                "chunk_level",
+                "chunk_idx",
+                "primary_structure_type",
+                "structure_types",
+                "image_metadata",
+                "semantic_chunking",
+                "parser_fallback",
+                "token_estimate",
+            ],
+            filter=filter_expr,
+        )
+
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                formatted_results.append({
+                    "id": hit.get("id"),
+                    "text": hit.get("entity", {}).get("text", ""),
+                    "filename": hit.get("entity", {}).get("filename", ""),
+                    "file_type": hit.get("entity", {}).get("file_type", ""),
+                    "page_number": hit.get("entity", {}).get("page_number", 0),
+                    "chunk_id": hit.get("entity", {}).get("chunk_id", ""),
+                    "parent_chunk_id": hit.get("entity", {}).get("parent_chunk_id", ""),
+                    "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
+                    "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
+                    "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
+                    "primary_structure_type": hit.get("entity", {}).get("primary_structure_type", ""),
+                    "structure_types": hit.get("entity", {}).get("structure_types", []),
+                    "image_metadata": hit.get("entity", {}).get("image_metadata", []),
+                    "semantic_chunking": hit.get("entity", {}).get("semantic_chunking", False),
+                    "parser_fallback": hit.get("entity", {}).get("parser_fallback", False),
+                    "token_estimate": hit.get("entity", {}).get("token_estimate", 0),
+                    "score": hit.get("distance", 0.0)
+                })
+
         return formatted_results
 
     def delete(self, filter_expr: str):

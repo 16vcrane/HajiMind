@@ -47,6 +47,12 @@ class MilvusWriter:
                     "parent_chunk_id": doc.get("parent_chunk_id", ""),
                     "root_chunk_id": doc.get("root_chunk_id", ""),
                     "chunk_level": doc.get("chunk_level", 0),
+                    "primary_structure_type": doc.get("primary_structure_type", "paragraph"),
+                    "structure_types": doc.get("structure_types", []),
+                    "image_metadata": doc.get("image_metadata", []),
+                    "semantic_chunking": bool(doc.get("semantic_chunking", False)),
+                    "parser_fallback": bool(doc.get("parser_fallback", False)),
+                    "token_estimate": int(doc.get("token_estimate", 0) or 0),
                 }
                 for doc, dense_emb, sparse_emb in zip(batch, dense_embeddings, sparse_embeddings)
             ]

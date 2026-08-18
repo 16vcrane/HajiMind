@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional, List
+from pydantic import BaseModel, Field
+from typing import Optional, List, Any
 
 
 class ChatRequest(BaseModel):
@@ -43,6 +43,32 @@ class RetrievedChunk(BaseModel):
 class RagTrace(BaseModel):
     tool_used: bool
     tool_name: str
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[int] = None
+    intent: Optional[str] = None
+    complexity: Optional[str] = None
+    route: Optional[str] = None
+    tool_calls: Optional[List[dict[str, Any]]] = None
+    rag_trace: Optional[dict[str, Any]] = None
+    task_traces: Optional[List[dict[str, Any]]] = None
+    recovery_attempts: Optional[int] = None
+    recovery_events: Optional[List[dict[str, Any]]] = None
+    latency: Optional[dict[str, Any]] = None
+    errors: Optional[List[str]] = None
+    final_status: Optional[str] = None
+    agent_trace: Optional[dict[str, Any]] = None
+    router_decision: Optional[dict[str, Any]] = None
+    route_target: Optional[str] = None
+    router_error: Optional[str] = None
+    plan: Optional[dict[str, Any]] = None
+    current_task: Optional[str] = None
+    task_results: Optional[dict[str, Any]] = None
+    completed_tasks: Optional[List[str]] = None
+    failed_tasks: Optional[List[str]] = None
+    execution_trace: Optional[List[dict[str, Any]]] = None
+    planner_error: Optional[str] = None
+    planner_cancelled: Optional[bool] = None
     query: Optional[str] = None
     expanded_query: Optional[str] = None
     step_back_question: Optional[str] = None
@@ -62,12 +88,18 @@ class RagTrace(BaseModel):
     rerank_error: Optional[str] = None
     retrieval_mode: Optional[str] = None
     candidate_k: Optional[int] = None
+    dense_weight: Optional[float] = None
+    sparse_weight: Optional[float] = None
+    bm25_k1: Optional[float] = None
+    bm25_b: Optional[float] = None
     leaf_retrieve_level: Optional[int] = None
     auto_merge_enabled: Optional[bool] = None
     auto_merge_applied: Optional[bool] = None
     auto_merge_threshold: Optional[int] = None
     auto_merge_replaced_chunks: Optional[int] = None
     auto_merge_steps: Optional[int] = None
+    conflict: Optional[dict[str, Any]] = None
+    memory_trace: Optional[dict[str, Any]] = None
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None
@@ -124,4 +156,40 @@ class DocumentUploadResponse(BaseModel):
 class DocumentDeleteResponse(BaseModel):
     filename: str
     chunks_deleted: int
+    message: str
+
+
+class MemoryCreateRequest(BaseModel):
+    content: str
+    memory_type: str = "long_term"
+    key: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    memory_type: Optional[str] = None
+    key: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class MemoryInfo(BaseModel):
+    id: int
+    user_id: int
+    memory_type: str
+    key: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_session_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    last_accessed_at: Optional[str] = None
+
+
+class MemoryListResponse(BaseModel):
+    memories: List[MemoryInfo]
+
+
+class MemoryDeleteResponse(BaseModel):
+    id: int
     message: str

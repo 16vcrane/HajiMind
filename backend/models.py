@@ -1,12 +1,16 @@
 """SQLAlchemy models for users, conversations, and parent chunks."""
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(Base):
@@ -20,6 +24,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
+    memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan")
 
 
 class ChatSession(Base):
@@ -54,6 +59,33 @@ class ChatMessage(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     session = relationship("ChatSession", back_populates="messages")
+
+
+class UserMemory(Base):
+    """Persisted long-term and preference memory, scoped to one user."""
+
+    __tablename__ = "user_memories"
+    __table_args__ = (
+        UniqueConstraint("user_id", "memory_type", "memory_key", name="uq_user_memory_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    memory_key: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    source_session_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_utcnow,
+        onupdate=_utcnow,
+        nullable=False,
+    )
+
+    user = relationship("User", back_populates="memories")
 
 
 class ParentChunk(Base):

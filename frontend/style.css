@@ -412,6 +412,120 @@ body {
     font-size: 0.82rem;
 }
 
+.agent-workflow-panel {
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 10px;
+    background: #fbfcff;
+    color: var(--text-color);
+    font-size: 0.82rem;
+}
+
+.workflow-title {
+    font-weight: 700;
+    color: var(--primary-color);
+    margin-bottom: 8px;
+}
+
+.workflow-row {
+    display: flex;
+    align-items: stretch;
+}
+
+.workflow-node,
+.workflow-tool-card {
+    min-width: 150px;
+    padding: 8px 10px;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 8px;
+    background: #fff;
+}
+
+.workflow-node-title,
+.workflow-tool-name {
+    display: block;
+    font-weight: 700;
+}
+
+.workflow-node-meta,
+.workflow-tool-meta {
+    display: block;
+    margin-top: 3px;
+    color: var(--text-light);
+    font-size: 0.76rem;
+}
+
+.workflow-arrow {
+    margin: 4px 0 4px 20px;
+    color: var(--text-light);
+}
+
+.workflow-tools-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+    gap: 8px;
+}
+
+.workflow-tool-status {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: #eef2f7;
+    color: #526070;
+    font-size: 0.72rem;
+}
+
+.workflow-tool-status.status-success,
+.workflow-tool-status.status-completed {
+    background: #e6f7ed;
+    color: #22834b;
+}
+
+.workflow-tool-status.status-error,
+.workflow-tool-status.status-failed,
+.workflow-tool-status.status-timeout {
+    background: #fdecec;
+    color: #c0392b;
+}
+
+.workflow-rag-modes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+}
+
+.workflow-rag-modes span {
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: #f2f5ff;
+    color: #526070;
+    font-size: 0.72rem;
+}
+
+.workflow-task-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.workflow-task-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: #fff;
+    border: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.workflow-task-status {
+    color: var(--primary-color);
+    font-weight: 700;
+}
+
 .bot-message .message-content {
     background-color: var(--bot-msg-bg);
     color: #444;

@@ -1,0 +1,2 @@
+{"question":"What is RAG?","gold_chunk_ids":["sample::p1::l3::0"],"expected_answer":"RAG combines retrieval and generation.","dataset_type":"gold"}
+{"question":"Explain BM25.","gold_chunk_ids":["sample::p2::l3::0"],"expected_answer":"BM25 is a sparse retrieval scoring function.","dataset_type":"synthetic"}

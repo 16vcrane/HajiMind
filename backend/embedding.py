@@ -12,14 +12,14 @@ load_dotenv()
 class EmbeddingService:
     """文本向量化服务 - 支持密集向量和稀疏向量"""
 
-    def __init__(self):
+    def __init__(self, *, k1: float | None = None, b: float | None = None):
         self.base_url = os.getenv("EMBEDDING_BASE_URL") or os.getenv("BASE_URL")
         self.embedder = os.getenv("EMBEDDER")
         self.api_key = os.getenv("ARK_API_KEY")
         
         # BM25 参数
-        self.k1 = 1.5  # 词频饱和参数
-        self.b = 0.75  # 文档长度归一化参数
+        self.k1 = float(k1 if k1 is not None else os.getenv("BM25_K1", "1.5"))
+        self.b = float(b if b is not None else os.getenv("BM25_B", "0.75"))
         
         # 词汇表（用于将词映射到稀疏向量索引）
         self._vocab = {}
